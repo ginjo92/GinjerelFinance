@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GinjerelFinance</title>
+    <link rel="icon" href="assets/brand/ginjerelfinance_logo.png" type="image/png">
+    <link rel="apple-touch-icon" href="assets/brand/ginjerelfinance_logo.png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Portfolio navigation">
+        <div class="brand-block">
+          <img class="brand-icon" src="assets/brand/ginjerelfinance_logo.png" alt="" aria-hidden="true">
+          <img class="brand-lettering" src="assets/brand/ginjerelfinance_lettering_wh.png" alt="GinjerelFinance">
+        </div>
+
+        <nav class="side-nav" aria-label="Dashboard sections">
+          <a class="active" href="#overview">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-5H4v5Zm10 0h6v-9h-6v9Zm0-16v5h6V4h-6Z"/></svg>
+            Overview
+          </a>
+          <a href="#holdings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14a2 2 0 0 1 2 2v13H3V6a2 2 0 0 1 2-2Zm0 13h14V6H5v11Zm2-8h6v2H7V9Zm0 4h10v2H7v-2Zm8-4h2v2h-2V9Z"/></svg>
+            Holdings
+          </a>
+          <a href="#rebalance" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h2v3h3v2H9v3H7V8H4V6h3V3Zm10 10h2v3h3v2h-3v3h-2v-3h-3v-2h3v-3ZM4 17.5 6.5 15 4 12.5 5.5 11 8 13.5 10.5 11l1.5 1.5L9.5 15l2.5 2.5-1.5 1.5L8 16.5 5.5 19 4 17.5Zm10-12L15.5 4 18 6.5 20.5 4 22 5.5 19.5 8l2.5 2.5-1.5 1.5L18 9.5 15.5 12 14 10.5 16.5 8 14 5.5Z"/></svg>
+            Rebalance
+          </a>
+          <a href="#activity">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v2H4V5Zm0 6h16v2H4v-2Zm0 6h10v2H4v-2Zm13.4 3.4-2.8-2.8 1.4-1.4 1.4 1.4 3.6-3.6 1.4 1.4-5 5Z"/></svg>
+            Activity
+          </a>
+        </nav>
+
+        <div class="sidebar-panel">
+          <p class="label">As of</p>
+          <strong id="asOfDate">-</strong>
+          <span id="dataSourceLabel">Sample data</span>
+        </div>
+      </aside>
+
+      <main class="dashboard">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Investment portfolio</p>
+            <h2 class="topbar-brand">
+              <img class="topbar-brand-icon" src="assets/brand/ginjerelfinance_logo.png" alt="" aria-hidden="true">
+              <img class="topbar-brand-lettering" src="assets/brand/ginjerelfinance_lettering.png" alt="GinjerelFinance">
+            </h2>
+          </div>
+
+          <div class="topbar-actions" aria-label="Dashboard controls">
+            <div class="market-status" id="marketStatus">EUR view</div>
+            <label class="search-box">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 4a5.5 5.5 0 0 1 4.38 8.83l4.65 4.64-1.06 1.06-4.64-4.65A5.5 5.5 0 1 1 9.5 4Zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/></svg>
+              <input id="holdingSearch" type="search" placeholder="Search ticker or name" autocomplete="off">
+            </label>
+            <button class="icon-button" id="refreshMarketData" type="button" aria-label="Refresh FX and prices" title="Refresh FX and prices">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5a7 7 0 0 1 6.32 4H16l3.5 3.5L23 9h-2.58A9 9 0 0 0 4.06 5.64l1.42 1.42A6.97 6.97 0 0 1 12 5Zm-7.5 6.5L1 15h2.58a9 9 0 0 0 16.36 3.36l-1.42-1.42A7 7 0 0 1 5.68 15H8l-3.5-3.5Z"/></svg>
+            </button>
+            <button class="icon-button" id="resetTargets" type="button" aria-label="Reset target allocation" title="Reset target allocation" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5a7 7 0 1 1-6.32 4H3.5A9 9 0 1 0 12 3v2Zm-6.5.5V11H11L8.9 8.9A5.96 5.96 0 0 1 12 8V6a7.95 7.95 0 0 0-4.52 1.4L5.5 5.5Z"/></svg>
+            </button>
+            <div class="top-add-wrapper">
+              <button class="icon-button add-button" id="globalAddButton" type="button" aria-label="Add or import" aria-expanded="false" aria-controls="globalAddMenu">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"/></svg>
+              </button>
+              <div class="action-menu" id="globalAddMenu" hidden>
+                <button type="button" data-action="import">Import Portfolio with CSV</button>
+                <button type="button" data-action="transaction">Add Transaction</button>
+                <button type="button" data-action="ticker">Add Ticker</button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section class="overview-grid" id="overview" aria-label="Portfolio summary">
+          <article class="portfolio-summary-panel">
+            <div class="portfolio-summary-header">
+              <div>
+                <p class="label">Portfolio</p>
+                <h3 id="summaryClassTitle">All</h3>
+              </div>
+              <div class="segmented-control compact portfolio-class-tabs" id="assetFilters" role="tablist" aria-label="Asset class filter"></div>
+            </div>
+
+            <strong class="portfolio-total" id="totalValue">EUR 0.00</strong>
+            <span id="summaryMarketLabel" hidden></span>
+            <div class="portfolio-value-bar" aria-hidden="true"><span id="summaryValueBar"></span></div>
+
+            <div class="portfolio-summary-rows">
+              <div class="portfolio-summary-row">
+                <span>Day Change</span>
+                <strong id="dayChange">EUR 0.00</strong>
+              </div>
+              <div class="portfolio-summary-row">
+                <span>Unrealized G/L</span>
+                <strong id="unrealizedGain">EUR 0.00</strong>
+              </div>
+              <div class="portfolio-summary-row">
+                <span>Realized G/L</span>
+                <strong id="realizedGain">EUR 0.00</strong>
+              </div>
+            </div>
+            <span id="valueChange" hidden></span>
+            <span id="dayChangePct" hidden></span>
+            <span id="ytdReturn" hidden></span>
+            <span id="benchmarkReturn" hidden></span>
+            <span id="cashBalance" hidden></span>
+            <span id="cashWeight" hidden></span>
+          </article>
+
+          <article class="panel performance-panel compact-performance-panel">
+            <div class="panel-header compact-panel-header">
+              <div>
+                <p class="label">Performance</p>
+                <h3>Portfolio vs markets</h3>
+              </div>
+              <div class="segmented-control compact" id="periodControls" role="tablist" aria-label="Chart period">
+                <button type="button" data-period="6M">6M</button>
+                <button class="active" type="button" data-period="1Y">1Y</button>
+                <button type="button" data-period="3Y">3Y</button>
+                <button type="button" data-period="ALL">All</button>
+              </div>
+            </div>
+            <div class="benchmark-controls compact-benchmark-controls" id="benchmarkControls" aria-label="Benchmark toggles"></div>
+            <div class="chart-frame compact-chart-frame">
+              <canvas id="performanceChart" aria-label="Portfolio performance line chart"></canvas>
+            </div>
+            <div class="chart-legend compact-chart-legend" id="chartLegend"></div>
+          </article>
+        </section>
+
+        <section class="content-grid" aria-label="Portfolio analytics">
+          <aside class="distribution-stack" aria-label="Portfolio distributions">
+            <article class="panel donut-panel">
+              <div class="donut-panel-header">
+                <div>
+                  <p class="label">Distribution</p>
+                  <h3>By type</h3>
+                </div>
+              </div>
+              <div class="donut-chart">
+                <canvas id="typeDistributionChart" aria-label="Distribution by asset type"></canvas>
+              </div>
+              <div class="donut-legend" id="typeDistributionLegend"></div>
+            </article>
+
+            <article class="panel donut-panel">
+              <div class="donut-panel-header">
+                <div>
+                  <p class="label">Distribution</p>
+                  <h3>By weight</h3>
+                </div>
+              </div>
+              <div class="donut-chart">
+                <canvas id="weightDistributionChart" aria-label="Distribution by portfolio weight"></canvas>
+              </div>
+              <div class="donut-legend" id="weightDistributionLegend"></div>
+            </article>
+
+            <article class="panel donut-panel">
+              <div class="donut-panel-header">
+                <div>
+                  <p class="label">Distribution</p>
+                  <h3>By sector/theme</h3>
+                </div>
+              </div>
+              <div class="donut-chart">
+                <canvas id="sectorDistributionChart" aria-label="Distribution by sector or theme"></canvas>
+              </div>
+              <div class="donut-legend" id="sectorDistributionLegend"></div>
+            </article>
+          </aside>
+        </section>
+        <section class="lower-grid">
+          <article class="panel holdings-panel" id="holdings">
+            <div class="panel-header">
+              <div>
+                <p class="label">Holdings</p>
+                <h3>Positions</h3>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="holdings-table">
+                <thead>
+                  <tr>
+                    <th><button type="button" data-sort="symbol">Ticker</button></th>
+                    <th class="number"><button type="button" data-sort="quantity">Qty</button></th>
+                    <th class="number"><button type="button" data-sort="avgPrice">Avg PE</button></th>
+                    <th class="number"><button type="button" data-sort="price">Price</button></th>
+                    <th class="number"><button type="button" data-sort="investedValue">Cost (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="marketValue">Value (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="gain">Gain (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="gainPct">Gain (%)</button></th>
+                    <th class="number"><button type="button" data-sort="dayGainEur">Today (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="dayChangePct">Today (%)</button></th>
+                    <th><button type="button" data-sort="assetClass">Class</button></th>
+                    <th><button type="button" data-sort="status">Status</button></th>
+                  </tr>
+                </thead>
+                <tbody id="holdingsBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel closed-positions-panel" id="closed-positions">
+            <div class="panel-header">
+              <div>
+                <p class="label">Closed positions</p>
+                <h3>Realized positions</h3>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="holdings-table closed-positions-table">
+                <thead>
+                  <tr>
+                    <th><button type="button" data-sort="symbol">Ticker</button></th>
+                    <th class="number"><button type="button" data-sort="quantity">Qty</button></th>
+                    <th class="number"><button type="button" data-sort="avgPrice">Avg PE</button></th>
+                    <th class="number"><button type="button" data-sort="price">Price</button></th>
+                    <th class="number"><button type="button" data-sort="investedValue">Cost (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="marketValue">Value (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="gain">Gain (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="gainPct">Gain (%)</button></th>
+                    <th class="number"><button type="button" data-sort="dayGainEur">Today (&euro;)</button></th>
+                    <th class="number"><button type="button" data-sort="dayChangePct">Today (%)</button></th>
+                    <th><button type="button" data-sort="assetClass">Class</button></th>
+                    <th><button type="button" data-sort="status">Status</button></th>
+                  </tr>
+                </thead>
+                <tbody id="closedPositionsBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel rebalance-panel" id="rebalance" hidden>
+            <div class="panel-header">
+              <div>
+                <p class="label">Targets</p>
+                <h3>Rebalance planner</h3>
+              </div>
+              <div class="target-total" id="targetTotal">100%</div>
+            </div>
+            <div class="target-list" id="targetList"></div>
+            <div class="trade-list" id="tradeList"></div>
+          </article>
+        </section>
+
+        <section class="profile-grid" aria-label="Investor profile">
+          <article class="panel profile-panel">
+            <div class="panel-header">
+              <div>
+                <p class="label">Investor profile</p>
+                <h3 id="profileTitle">Portfolio read</h3>
+              </div>
+              <div class="profile-score" id="profileScore">0 / 100</div>
+            </div>
+            <p class="profile-summary" id="profileSummary"></p>
+            <div class="profile-columns">
+              <div>
+                <p class="label">What this suggests</p>
+                <ul class="insight-list" id="profileInsights"></ul>
+              </div>
+              <div>
+                <p class="label">Good guardrails</p>
+                <ul class="insight-list" id="profileGuardrails"></ul>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="activity-grid" id="activity" aria-label="Transaction activity">
+          <article class="panel activity-panel">
+            <div class="panel-header">
+              <div>
+                <p class="label">Activity</p>
+                <h3>Transactions</h3>
+              </div>
+              <div class="activity-actions">
+                <label class="mini-search">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 4a5.5 5.5 0 0 1 4.38 8.83l4.65 4.64-1.06 1.06-4.64-4.65A5.5 5.5 0 1 1 9.5 4Zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/></svg>
+                  <input id="transactionSymbolFilter" type="search" placeholder="Filter ticker" autocomplete="off">
+                </label>
+                <div class="history-count" id="transactionCount">0 entries</div>
+                <button class="icon-button" id="activityAddTransaction" type="button" aria-label="Add transaction" title="Add transaction">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="bulk-actions" id="bulkTransactionBar" hidden>
+              <span id="bulkTransactionCount">0 selected</span>
+              <input id="bulkTransactionPlatform" type="hidden" value="Other">
+              <div class="platform-icon-picker compact-icons" id="bulkTransactionPlatformPicker" role="radiogroup" aria-label="Bulk broker"></div>
+              <button class="secondary-button" id="bulkApplyPlatform" type="button">Apply broker</button>
+              <button class="danger-button" id="bulkDeleteTransactions" type="button">Delete selected</button>
+              <button class="secondary-button" id="bulkClearTransactions" type="button">Clear</button>
+              <p class="form-status" id="bulkTransactionStatus" role="status"></p>
+            </div>
+            <div class="table-wrap">
+              <table class="activity-table">
+                <thead>
+                  <tr>
+                    <th class="select-column"><input id="selectAllTransactions" type="checkbox" aria-label="Select all visible transactions"></th>
+                    <th>Date</th>
+                    <th>Type</th>
+                    <th>Ticker</th>
+                    <th class="number">Qty</th>
+                    <th class="number">Price</th>
+                    <th class="number">Fees</th>
+                    <th class="number">Impact</th>
+                    <th class="number">Edit</th>
+                  </tr>
+                </thead>
+                <tbody id="transactionsBody"></tbody>
+              </table>
+            </div>
+            <div class="transactions-footer">
+              <button class="secondary-button" id="toggleTransactions" type="button" hidden>Show more</button>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div class="modal-backdrop" id="modalBackdrop" hidden></div>
+
+    <section class="modal" id="importModal" role="dialog" aria-modal="true" aria-labelledby="importModalTitle" hidden>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <div>
+            <p class="label">CSV import</p>
+            <h3 id="importModalTitle">Import transactions</h3>
+          </div>
+          <button class="icon-button modal-close" type="button" data-close-modal aria-label="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+
+        <div class="import-modal-body">
+          <label class="file-picker modal-file-picker">
+            <input id="csvFile" type="file" accept=".csv,text/csv">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 20H5a2 2 0 0 1-2-2v-3h2v3h14v-3h2v3a2 2 0 0 1-2 2ZM13 4v8.17l2.59-2.58L17 11l-5 5-5-5 1.41-1.41L11 12.17V4h2Z"/></svg>
+            <span id="csvFileName">Choose CSV</span>
+          </label>
+          <div class="segmented-control" id="importMode" role="tablist" aria-label="Import mode">
+            <button class="active" type="button" data-mode="replace">Replace history</button>
+            <button type="button" data-mode="append">Append</button>
+          </div>
+          <p class="modal-note">Transaction imports rebuild the portfolio from the CSV. Trade dates like 20250131 are shown as 31.01.2025.</p>
+        </div>
+
+        <div class="modal-footer">
+          <span class="transaction-preview" id="importPreview">No file selected</span>
+          <div class="modal-actions">
+            <button class="secondary-button" type="button" data-close-modal>Cancel</button>
+            <button class="primary-button" id="importCsv" type="button">Import</button>
+          </div>
+        </div>
+        <p class="form-status" id="importModalStatus" role="status"></p>
+        <button id="resetPortfolio" type="button" hidden>Reset demo</button>
+      </div>
+    </section>
+
+    <section class="modal" id="transactionModal" role="dialog" aria-modal="true" aria-labelledby="transactionModalTitle" hidden>
+      <form class="modal-panel" id="transactionForm">
+        <div class="modal-header">
+          <div>
+            <p class="label">Transactions</p>
+            <h3 id="transactionModalTitle">Add transaction</h3>
+          </div>
+          <button class="icon-button modal-close" type="button" data-close-modal aria-label="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+
+        <div class="modal-form-grid">
+          <label>
+            <span>Date</span>
+            <input id="transactionDate" name="date" type="date">
+          </label>
+          <label>
+            <span>Type</span>
+            <select id="transactionType" name="type">
+              <option value="buy">Buy</option>
+              <option value="sell">Sell</option>
+              <option value="deposit">Deposit</option>
+              <option value="withdraw">Withdraw</option>
+              <option value="dividend">Dividend</option>
+              <option value="fee">Fee</option>
+            </select>
+          </label>
+          <label>
+            <span>Class</span>
+            <select id="transactionAssetClass" name="assetClass"></select>
+          </label>
+          <div class="platform-picker-field">
+            <input id="transactionPlatform" name="platform" type="hidden" value="Other">
+            <div class="platform-icon-picker" id="transactionPlatformPicker" role="radiogroup" aria-label="Broker"></div>
+          </div>
+          <label>
+            <span>Ticker</span>
+            <div class="lookup-row">
+              <input id="transactionTickerSearch" name="tickerSearch" type="search" list="transactionTickerOptions" placeholder="Search ticker" autocomplete="off">
+              <button class="secondary-button" id="transactionAddTicker" type="button">Add ticker</button>
+            </div>
+            <datalist id="transactionTickerOptions"></datalist>
+          </label>
+          <label>
+            <span>Quantity</span>
+            <input id="transactionQuantity" name="quantity" type="number" min="0" step="any" placeholder="0">
+          </label>
+          <label>
+            <span>Price</span>
+            <input id="transactionPrice" name="price" type="number" min="0" step="any" placeholder="0.00">
+          </label>
+          <label>
+            <span>Fees</span>
+            <input id="transactionFees" name="fees" type="number" min="0" step="any" placeholder="0.00">
+          </label>
+          <label>
+            <span>Currency</span>
+            <select id="transactionCurrency" name="currency">
+              <option value="EUR">EUR</option>
+              <option value="USD">USD</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="modal-footer">
+          <strong class="transaction-preview" id="transactionPreview">+EUR 0.00</strong>
+          <div class="modal-actions">
+            <button class="danger-button" id="deleteTransaction" type="button" hidden>Delete</button>
+            <button class="secondary-button" type="button" data-close-modal>Cancel</button>
+            <button class="primary-button" type="submit">Done</button>
+          </div>
+        </div>
+        <p class="form-status" id="transactionStatus" role="status"></p>
+      </form>
+    </section>
+
+    <section class="modal" id="tickerModal" role="dialog" aria-modal="true" aria-labelledby="tickerModalTitle" hidden>
+      <form class="modal-panel" id="tickerForm">
+        <div class="modal-header">
+          <div>
+            <p class="label">Tickers</p>
+            <h3 id="tickerModalTitle">Add ticker</h3>
+          </div>
+          <button class="icon-button modal-close" type="button" data-close-modal aria-label="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+
+        <div class="modal-form-grid">
+          <label>
+            <span>Ticker</span>
+            <div class="lookup-row">
+              <input id="tickerSymbol" name="symbol" type="text" placeholder="VWCE.DE" autocomplete="off" required>
+              <button class="secondary-button" id="tickerLookup" type="button">Lookup</button>
+            </div>
+          </label>
+          <label>
+            <span>Name</span>
+            <input id="tickerName" name="name" type="text" placeholder="Optional">
+          </label>
+          <label>
+            <span>Class</span>
+            <select id="tickerAssetClass" name="assetClass"></select>
+          </label>
+          <div class="platform-picker-field">
+            <input id="tickerPlatform" name="platform" type="hidden" value="Other">
+            <div class="platform-icon-picker" id="tickerPlatformPicker" role="radiogroup" aria-label="Broker"></div>
+          </div>
+          <label>
+            <span>Currency</span>
+            <select id="tickerCurrency" name="currency">
+              <option value="EUR">EUR</option>
+              <option value="USD">USD</option>
+            </select>
+          </label>
+          <label>
+            <span>Last price</span>
+            <input id="tickerPrice" name="price" type="number" min="0" step="any" placeholder="Lookup or enter">
+          </label>
+        </div>
+
+        <div class="modal-footer">
+          <span class="transaction-preview" id="tickerCount">0 tickers</span>
+          <div class="modal-actions">
+            <button class="secondary-button" type="button" data-close-modal>Cancel</button>
+            <button class="primary-button" type="submit">Done</button>
+          </div>
+        </div>
+        <p class="form-status" id="tickerStatus" role="status"></p>
+      </form>
+    </section>
+
+
+    <section class="modal" id="stockModal" role="dialog" aria-modal="true" aria-labelledby="stockAnalysisTicker" hidden>
+      <div class="modal-panel stock-modal-panel">
+        <div class="modal-header stock-analysis-header">
+          <div class="stock-analysis-title">
+            <span id="stockAnalysisLogo"></span>
+            <div>
+              <p class="label">Stock analysis</p>
+              <h3 id="stockAnalysisTicker">Ticker</h3>
+              <span id="stockAnalysisName">Loading company data</span>
+            </div>
+          </div>
+          <button class="icon-button modal-close" type="button" data-close-modal aria-label="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+        <div class="stock-analysis-content" id="stockAnalysisContent"></div>
+        <div class="manual-yahoo-link">
+          <label>
+            <span>Source link</span>
+            <input id="stockManualYahooUrl" type="url" placeholder="StockAnalysis, Google Finance, MarketBeat URL, or ticker" autocomplete="off">
+          </label>
+          <button class="secondary-button" id="saveStockManualYahooUrl" type="button">Use link</button>
+        </div>
+        <p class="modal-note">If automatic lookup fails, paste a StockAnalysis, Google Finance, MarketBeat, or Nasdaq URL for this ticker and save it.</p>
+        <p class="form-status" id="stockAnalysisStatus" role="status"></p>
+      </div>
+    </section>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+# Private portfolio data
+*.csv
+*.xlsx
+*.xls
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
