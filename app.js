@@ -1,6 +1,8 @@
 const BASE_CURRENCY = "EUR";
 const MARKET_REFRESH_MS = 60_000;
+const NEWS_SENTIMENT_REFRESH_MS = 30 * 60 * 1000;
 const TRANSACTION_PREVIEW_LIMIT = 10;
+const WATCHLIST_ACTION_LIMIT = 8;
 
 const platformDefinitions = [
   { name: "Trade Republic", slug: "traderepublic", color: "00A58E", initials: "TR" },
@@ -27,6 +29,13 @@ const companyNameOverrides = {
   APPL: "Apple Inc.",
   ALB: "Albemarle Corporation",
   TE: "T1 Energy Inc.",
+  RGTI: "Rigetti Computing, Inc.",
+  IONQ: "IonQ, Inc.",
+  QBTS: "D-Wave Quantum Inc.",
+  QUBT: "Quantum Computing Inc.",
+  IBM: "International Business Machines Corporation",
+  MSFT: "Microsoft Corporation",
+  GOOGL: "Alphabet Inc.",
 };
 const companyLogoSymbolOverrides = {
   APPL: "AAPL",
@@ -188,7 +197,9 @@ const storageKeys = {
   fx: "portfolioFx",
   benchmarks: "portfolioBenchmarks",
   stockAnalysis: "portfolioStockAnalysis",
+  newsSentiment: "portfolioNewsSentiment",
   manualYahooLinks: "portfolioManualYahooLinks",
+  watchlists: "portfolioWatchlists",
 };
 
 const state = {
@@ -208,12 +219,29 @@ const state = {
   activeBenchmarks: ["sp500", "nasdaq", "world"],
   benchmarkSeries: loadBenchmarkSeries(),
   stockAnalysis: loadStockAnalysisCache(),
+  newsSentiment: loadNewsSentimentCache(),
   manualYahooLinks: loadManualYahooLinks(),
+  watchlists: loadWatchlists(),
+  stockChartSeries: {},
+  stockChartPeriod: "6M",
+  stockChartHoverX: null,
   selectedStockSymbol: "",
   marketMessage: "",
   marketRefreshing: false,
+  newsSentimentLoading: false,
+  newsSentimentMessage: "",
+  refreshDetail: "",
   performanceHoverX: null,
   donutHover: { typeDistributionChart: null, weightDistributionChart: null, sectorDistributionChart: null },
+  chatOpen: false,
+  chatPending: false,
+  chatMessages: [
+    {
+      role: "assistant",
+      content: "Ask me about portfolio risk, concentration, sectors, realized gains, or ask me to build a research watchlist.",
+      mode: "ai",
+    },
+  ],
 };
 
 let holdings = loadHoldings();
@@ -246,7 +274,8 @@ const moneyFormatters = new Map();
 document.addEventListener("DOMContentLoaded", () => {
   wireControls();
   render();
-  refreshMarketData({ quiet: true, forceAnalysis: true });
+  refreshMarketData({ quiet: true });
+  refreshNewsSentiment({ quiet: true });
   window.setInterval(() => refreshMarketData({ quiet: true }), MARKET_REFRESH_MS);
   window.addEventListener("resize", debounce(renderCharts, 120));
 });
@@ -351,13 +380,15 @@ function wireControls() {
     const button = event.target.closest("button[data-benchmark]");
     if (!button) return;
     const id = button.dataset.benchmark;
-    if (state.activeBenchmarks.includes(id)) {
+    const wasActive = state.activeBenchmarks.includes(id);
+    if (wasActive) {
       state.activeBenchmarks = state.activeBenchmarks.filter((benchmarkId) => benchmarkId !== id);
     } else {
       state.activeBenchmarks = [...state.activeBenchmarks, id];
     }
     renderBenchmarkControls();
     renderPerformanceChart();
+    if (!wasActive && !state.benchmarkSeries[id]?.length) refreshBenchmarkOnDemand(id);
   });
 
   document.getElementById("assetFilters").addEventListener("click", (event) => {
@@ -386,6 +417,40 @@ function wireControls() {
     });
   });
 
+  document.getElementById("stockAnalysisContent").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-refresh-stock-news]");
+    if (button) {
+      refreshNewsSentimentForSymbols([button.dataset.refreshStockNews], { force: true });
+      return;
+    }
+
+    const reloadChartButton = event.target.closest("[data-reload-stock-chart]");
+    if (reloadChartButton) {
+      const symbol = normalizeSymbol(reloadChartButton.dataset.reloadStockChart);
+      delete state.stockChartSeries[symbol];
+      loadStockChartSeriesForSymbol(symbol, getHoldingForAnalysis(symbol));
+      return;
+    }
+
+    const periodButton = event.target.closest("[data-stock-chart-period]");
+    if (!periodButton) return;
+    state.stockChartPeriod = periodButton.dataset.stockChartPeriod || "6M";
+    state.stockChartHoverX = null;
+    renderStockAnalysisModal(state.selectedStockSymbol, getHoldingForAnalysis(state.selectedStockSymbol), state.stockAnalysis[state.selectedStockSymbol] || null, false);
+  });
+  document.getElementById("stockAnalysisContent").addEventListener("mousemove", (event) => {
+    const chart = event.target.closest("[data-stock-chart]");
+    if (!chart) return;
+    const rect = chart.getBoundingClientRect();
+    state.stockChartHoverX = safeRatio(event.clientX - rect.left, rect.width) * 760;
+    renderStockAnalysisModal(state.selectedStockSymbol, getHoldingForAnalysis(state.selectedStockSymbol), state.stockAnalysis[state.selectedStockSymbol] || null, false);
+  });
+  document.getElementById("stockAnalysisContent").addEventListener("mouseleave", () => {
+    if (!Number.isFinite(state.stockChartHoverX)) return;
+    state.stockChartHoverX = null;
+    renderStockAnalysisModal(state.selectedStockSymbol, getHoldingForAnalysis(state.selectedStockSymbol), state.stockAnalysis[state.selectedStockSymbol] || null, false);
+  });
+
   document.querySelectorAll(".holdings-table thead").forEach((thead) => {
     thead.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-sort]");
@@ -401,10 +466,247 @@ function wireControls() {
     });
   });
 
+  wirePortfolioChat();
+  wireWatchlists();
   wireFloatingActions();
   wireModalForms();
 }
 
+function wirePortfolioChat() {
+  const toggle = document.getElementById("portfolioChatToggle");
+  const close = document.getElementById("portfolioChatClose");
+  const form = document.getElementById("portfolioChatForm");
+  const input = document.getElementById("portfolioChatInput");
+  const suggestions = document.querySelectorAll("[data-chat-prompt]");
+  const messages = document.getElementById("portfolioChatMessages");
+
+  if (!toggle || !close || !form || !input || !messages) return;
+
+  toggle.addEventListener("click", () => setPortfolioChatOpen(!state.chatOpen));
+  close.addEventListener("click", () => setPortfolioChatOpen(false));
+  messages.addEventListener("click", handleChatActionClick);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendPortfolioChatMessage(input.value);
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    sendPortfolioChatMessage(input.value);
+  });
+  suggestions.forEach((button) => {
+    button.addEventListener("click", () => {
+      input.value = button.dataset.chatPrompt || "";
+      sendPortfolioChatMessage(input.value);
+    });
+  });
+}
+
+function setPortfolioChatOpen(open) {
+  state.chatOpen = Boolean(open);
+  renderPortfolioChat();
+  if (state.chatOpen) {
+    window.setTimeout(() => document.getElementById("portfolioChatInput")?.focus(), 0);
+  }
+}
+
+async function sendPortfolioChatMessage(rawMessage) {
+  const input = document.getElementById("portfolioChatInput");
+  const message = String(rawMessage || "").trim();
+  if (!message || state.chatPending) return;
+
+  state.chatMessages.push({ role: "user", content: message });
+  state.chatPending = true;
+  if (input) input.value = "";
+  setChatStatus("Thinking with your latest portfolio data...", "");
+  renderPortfolioChat();
+
+  try {
+    const result = await requestPortfolioAiReply(message);
+    state.chatMessages.push({ role: "assistant", content: result.reply, mode: "ai", actions: result.actions });
+    setChatStatus("AI response generated from your local portfolio snapshot.", "success");
+  } catch (error) {
+    const detail = error.message || "AI server is unavailable.";
+    if (isWatchlistPrompt(message)) {
+      const curated = buildCuratedWatchlistResponse(message);
+      state.chatMessages.push({ role: "assistant", content: curated.reply, mode: "curated", actions: curated.actions });
+      setChatStatus(`Curated research watchlist shown because the AI server is unavailable. ${detail}`.trim(), "warning");
+    } else {
+      state.chatMessages.push({
+        role: "assistant",
+        content: `I need the AI server to answer accurately. Start the local AI server with your OpenAI API key, then try again. (${detail})`,
+        mode: "error",
+        actions: [],
+      });
+      setChatStatus(`AI server required. ${detail}`.trim(), "warning");
+    }
+  } finally {
+    state.chatPending = false;
+    renderPortfolioChat();
+  }
+}
+
+async function requestPortfolioAiReply(message) {
+  const response = await fetch(getPortfolioChatEndpoint(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      context: buildPortfolioAiContext(),
+      history: state.chatMessages.slice(-8).map(({ role, content }) => ({ role, content })),
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || `AI server returned HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  const reply = String(data.reply || "").trim();
+  if (!reply) throw new Error("AI server returned an empty reply.");
+  return {
+    reply,
+    actions: normalizeChatActions(data.actions, message, { allowFallback: isWatchlistPrompt(message) }),
+  };
+}
+
+function getPortfolioChatEndpoint() {
+  if (/^https?:$/i.test(window.location.protocol)) return "/api/portfolio-chat";
+  return "http://localhost:8787/api/portfolio-chat";
+}
+
+function renderPortfolioChat() {
+  const panel = document.getElementById("portfolioChatPanel");
+  const toggle = document.getElementById("portfolioChatToggle");
+  const messages = document.getElementById("portfolioChatMessages");
+  const sendButton = document.getElementById("portfolioChatSend");
+  if (!panel || !toggle || !messages || !sendButton) return;
+
+  panel.hidden = !state.chatOpen;
+  toggle.setAttribute("aria-expanded", String(state.chatOpen));
+  sendButton.disabled = state.chatPending;
+  messages.innerHTML = state.chatMessages
+    .map((message, index) => `
+      <div class="ai-chat-message ${message.role === "user" ? "user-message" : "assistant-message"}">
+        <p>${escapeHtml(message.content)}</p>
+        ${message.mode === "error" && message.role === "assistant" ? `<span>AI server required</span>` : ""}
+        ${message.mode === "curated" && message.role === "assistant" ? `<span>Curated watchlist</span>` : ""}
+        ${renderChatActions(message.actions, index)}
+      </div>
+    `)
+    .join("") + (state.chatPending ? `<div class="ai-chat-message assistant-message thinking"><p>Reading the portfolio...</p></div>` : "");
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function setChatStatus(message, type = "") {
+  const status = document.getElementById("portfolioChatStatus");
+  if (!status) return;
+  status.textContent = message || "Portfolio coach, not regulated financial advice.";
+  status.className = `ai-chat-status ${type}`.trim();
+}
+
+function buildPortfolioAiContext() {
+  const visibleHoldings = getVisibleHoldings();
+  const totalValue = getTotalValue();
+  const totalCost = getTotalCost();
+  const unrealizedGain = totalValue - totalCost;
+  const realizedGain = holdings
+    .filter((holding) => holding.symbol && holding.symbol !== "CASH")
+    .reduce((sum, holding) => sum + getRealizedGainEUR(holding), 0);
+  const dayChange = visibleHoldings.reduce((sum, holding) => sum + getMarketValue(holding) * ((Number(holding.dayChangePct) || 0) / 100), 0);
+  const profile = buildInvestorProfile();
+  const newsRisk = buildPortfolioNewsRisk();
+
+  return {
+    baseCurrency: BASE_CURRENCY,
+    generatedAt: new Date().toISOString(),
+    summary: {
+      marketValueEUR: roundForContext(totalValue),
+      costEUR: roundForContext(totalCost),
+      unrealizedGainEUR: roundForContext(unrealizedGain),
+      unrealizedGainPct: roundForContext(safePercent(unrealizedGain, totalCost)),
+      realizedGainEUR: roundForContext(realizedGain),
+      dayChangeEUR: roundForContext(dayChange),
+      dayChangePct: roundForContext(safePercent(dayChange, totalValue)),
+    },
+    profile: {
+      title: profile.title,
+      score: profile.overallScore,
+      summary: profile.summary,
+      factorScores: profile.factors.map((factor) => ({ label: factor.label, score: factor.score, detail: factor.detail })),
+    },
+    newsRisk: {
+      score: newsRisk.hasCoverage ? newsRisk.score : null,
+      level: newsRisk.hasCoverage ? newsRisk.level : "Unavailable",
+      coverage: newsRisk.detail,
+      summary: newsRisk.summary,
+    },
+    assetWeights: getAssetWeightRows().map((row) => ({ label: row.label, weightPct: roundForContext(row.weight) })),
+    sectorThemeWeights: getThemeWeightRows().map((row) => ({ label: row.label, weightPct: roundForContext(row.weight), valueEUR: roundForContext(row.value) })),
+    holdings: getHoldingWeightRows().slice(0, 30).map((row) => {
+      const holding = getHoldingForAnalysis(row.symbol);
+      const analysis = getAnalysisForHolding(holding);
+      const news = getNewsSentimentForSymbol(row.symbol);
+      return {
+        ticker: row.symbol,
+        name: row.name,
+        class: displayAssetClass(holding.assetClass || ""),
+        sectorTheme: getHoldingSectorTheme(holding),
+        sector: cleanSectorLabel(analysis.sector || ""),
+        quantity: roundForContext(holding.quantity),
+        price: roundForContext(holding.price),
+        currency: holding.currency,
+        valueEUR: roundForContext(row.value),
+        costEUR: roundForContext(getCostBasisEUR(holding)),
+        weightPct: roundForContext(row.weight),
+        unrealizedGainEUR: roundForContext(getHoldingGainEUR(holding)),
+        gainPct: roundForContext(safePercent(getHoldingGainEUR(holding), getInvestedValueEUR(holding))),
+        dayChangePct: roundForContext(Number(holding.dayChangePct) || 0),
+        newsSentiment: news?.sentiment || "",
+        newsRiskScore: news ? roundForContext(news.riskScore) : null,
+        newsRiskFlags: news?.riskFlags || [],
+        topNewsHeadline: news?.headlines?.[0]?.title || "",
+      };
+    }),
+    closedPositions: getClosedDisplayHoldings().slice(0, 20).map((holding) => ({
+      ticker: holding.symbol,
+      name: getKnownCompanyName(holding.symbol, holding) || holding.name || holding.symbol,
+      class: displayAssetClass(holding.assetClass || ""),
+      realizedGainEUR: roundForContext(getRealizedGainEUR(holding)),
+      lifetimeInvestedEUR: roundForContext(getLifetimeInvestedEUR(holding)),
+    })),
+    realizedByClass: getRealizedGainRows().map((row) => ({ label: row.label, realizedGainEUR: roundForContext(row.value) })),
+    recentTransactions: [...state.transactions].sort(compareTransactionsDesc).slice(0, 25).map((transaction) => ({
+      date: formatTransactionDate(transaction),
+      type: transaction.type,
+      ticker: transaction.symbol,
+      quantity: roundForContext(transaction.quantity),
+      price: roundForContext(transaction.price),
+      fees: roundForContext(transaction.fees),
+      currency: transaction.currency,
+      impactEUR: roundForContext(transaction.cashImpactEUR),
+    })),
+    watchlists: state.watchlists.map((watchlist) => ({
+      title: watchlist.title,
+      theme: watchlist.theme,
+      createdAt: watchlist.createdAt,
+      tickers: watchlist.items.map((item) => ({ ticker: item.ticker, name: item.name, reason: item.reason })),
+    })),
+  };
+}
+
+function buildCuratedWatchlistResponse(message) {
+  const watchlist = buildThematicWatchlistAction(message);
+  return {
+    reply: `I built a curated research watchlist for ${watchlist.theme}. This is not a buy list; use it to open each ticker and check valuation, financials, catalysts, analyst targets, and whether it actually fits your portfolio.`,
+    actions: [watchlist],
+  };
+}
+function roundForContext(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 100) / 100 : 0;
+}
 function wireFloatingActions() {
   const globalAddButton = document.getElementById("globalAddButton");
   const globalAddMenu = document.getElementById("globalAddMenu");
@@ -507,17 +809,20 @@ function render() {
 
   document.getElementById("dataSourceLabel").textContent = hasSavedHoldings() ? "Local data" : "Sample data";
 
+  renderVisibleRefreshOverlay();
   renderMarketStatus();
   renderSummary();
   renderFilters();
   renderBenchmarkControls();
   renderFormOptions();
   renderHoldings();
+  renderWatchlists();
   renderTargets();
   renderTransactions();
   renderInvestorProfile();
   renderCharts();
   updateTransactionPreview();
+  renderPortfolioChat();
 }
 
 function wireDonutHover(canvasId) {
@@ -538,13 +843,28 @@ function wireDonutHover(canvasId) {
     renderDistributionCharts();
   });
 }
+function renderVisibleRefreshOverlay() {
+  const overlay = document.getElementById("visibleRefreshOverlay");
+  if (!overlay) return;
+  overlay.hidden = true;
+}
 function renderMarketStatus() {
   const usdToEur = state.fx.ratesToEUR.USD;
   const eurToUsd = state.fx.eurToUsd || safeRatio(1, usdToEur);
   const updated = state.fx.updatedAt ? shortTime(state.fx.updatedAt) : "fallback";
-  const prefix = state.marketRefreshing ? "Refreshing" : "EUR view";
-  document.getElementById("marketStatus").textContent =
-    state.marketMessage || `${prefix} | USD/EUR ${formatDecimal(usdToEur)} | EUR/USD ${formatDecimal(eurToUsd)} | ${updated}`;
+  const status = document.getElementById("marketStatus");
+  const refreshButton = document.getElementById("refreshMarketData");
+  const loading = state.marketRefreshing || state.newsSentimentLoading;
+  const prefix = state.marketRefreshing ? "Refreshing portfolio" : state.newsSentimentLoading ? "Checking news" : "EUR view";
+  const message = state.newsSentimentLoading && state.newsSentimentMessage
+    ? state.newsSentimentMessage
+    : state.marketMessage || `${prefix} | USD/EUR ${formatDecimal(usdToEur)} | EUR/USD ${formatDecimal(eurToUsd)} | ${updated}`;
+  status.classList.toggle("is-loading", loading);
+  status.innerHTML = `${loading ? `<span class="status-spinner" aria-hidden="true"></span>` : ""}<span>${escapeHtml(message)}</span>`;
+  if (refreshButton) {
+    refreshButton.classList.toggle("is-loading", loading);
+    refreshButton.disabled = state.marketRefreshing;
+  }
 }
 
 function renderSummary() {
@@ -742,6 +1062,357 @@ function renderHoldings() {
   }
 }
 
+
+function wireWatchlists() {
+  const section = document.getElementById("watchlist");
+  if (!section) return;
+
+  section.addEventListener("click", (event) => {
+    const removeButton = event.target.closest("[data-remove-watchlist]");
+    if (removeButton) {
+      removeWatchlist(removeButton.dataset.removeWatchlist);
+      return;
+    }
+
+    const tickerButton = event.target.closest("[data-watchlist-symbol]");
+    if (!tickerButton) return;
+    openStockAnalysis(tickerButton.dataset.watchlistSymbol);
+  });
+}
+
+function getSafeKnownCompanyName(symbol) {
+  try {
+    return getKnownCompanyName(symbol) || "";
+  } catch {
+    return "";
+  }
+}
+function renderWatchlists() {
+  const section = document.getElementById("watchlist");
+  const body = document.getElementById("watchlistBody");
+  if (!section || !body) return;
+
+  section.hidden = !state.watchlists.length;
+  body.innerHTML = state.watchlists.map(renderWatchlistCard).join("");
+}
+
+function renderWatchlistCard(watchlist) {
+  const created = formatWatchlistDate(watchlist.createdAt);
+  return `
+    <article class="watchlist-card">
+      <div class="watchlist-card-header">
+        <div>
+          <p class="label">${escapeHtml(watchlist.theme || "Research")}</p>
+          <h3>${escapeHtml(watchlist.title || "Research watchlist")}</h3>
+          <span>${escapeHtml(created)} | ${watchlist.items.length} tickers | Research only</span>
+        </div>
+        <button class="secondary-button compact-button" type="button" data-remove-watchlist="${escapeAttribute(watchlist.id)}">Remove</button>
+      </div>
+      <div class="watchlist-items">
+        ${watchlist.items.map(renderWatchlistItem).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderWatchlistItem(item) {
+  const symbol = normalizeSymbol(item.ticker || item.symbol);
+  const name = item.name && item.name !== symbol ? item.name : getSafeKnownCompanyName(symbol) || "Open analysis";
+  const details = [item.sectorTheme, item.risk].filter(Boolean).join(" | ");
+  return `
+    <article class="watchlist-item">
+      <button class="watchlist-symbol" type="button" data-watchlist-symbol="${escapeAttribute(symbol)}" aria-label="Open analysis for ${escapeAttribute(symbol)}">
+        <strong>${escapeHtml(symbol)}</strong>
+        <span>${escapeHtml(name)}</span>
+      </button>
+      <p>${escapeHtml(item.reason || "Research candidate generated by Ginjerel.")}</p>
+      ${details ? `<span class="watchlist-meta">${escapeHtml(details)}</span>` : ""}
+    </article>
+  `;
+}
+
+function renderChatActions(actions, messageIndex) {
+  const safeActions = Array.isArray(actions) ? actions : [];
+  if (!safeActions.length) return "";
+  return `<div class="ai-chat-actions">${safeActions.map((action, actionIndex) => renderChatAction(action, messageIndex, actionIndex)).join("")}</div>`;
+}
+
+function renderChatAction(action, messageIndex, actionIndex) {
+  if (action?.type !== "watchlist") return "";
+  const items = Array.isArray(action.items) ? action.items.slice(0, WATCHLIST_ACTION_LIMIT) : [];
+  return `
+    <article class="ai-action-card">
+      <div class="ai-action-card-header">
+        <div>
+          <p class="label">Research watchlist</p>
+          <h4>${escapeHtml(action.title || "Watchlist")}</h4>
+        </div>
+        <button class="primary-button compact-button" type="button" data-chat-action="add-watchlist" data-message-index="${messageIndex}" data-action-index="${actionIndex}">Add</button>
+      </div>
+      <div class="ai-action-items">
+        ${items.map((item) => `
+          <button type="button" data-chat-action="open-ticker" data-chat-symbol="${escapeAttribute(item.ticker)}">
+            <strong>${escapeHtml(item.ticker)}</strong>
+            <span>${escapeHtml(item.name || item.reason || "Research candidate")}</span>
+          </button>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function handleChatActionClick(event) {
+  const button = event.target.closest("[data-chat-action]");
+  if (!button) return;
+
+  const actionType = button.dataset.chatAction;
+  if (actionType === "open-ticker") {
+    openStockAnalysis(button.dataset.chatSymbol);
+    return;
+  }
+
+  if (actionType !== "add-watchlist") return;
+  const action = getChatAction(button.dataset.messageIndex, button.dataset.actionIndex);
+  const watchlist = addWatchlistFromAction(action);
+  if (!watchlist) return;
+  setChatStatus(`Added ${watchlist.title} with ${watchlist.items.length} tickers.`, "success");
+  render();
+}
+
+function getChatAction(messageIndex, actionIndex) {
+  const message = state.chatMessages[Number(messageIndex)];
+  return message?.actions?.[Number(actionIndex)] || null;
+}
+
+function normalizeChatActions(actions, sourceMessage = "", options = {}) {
+  const normalized = (Array.isArray(actions) ? actions : [])
+    .map(normalizeWatchlistAction)
+    .filter(Boolean)
+    .map((action) => completeWatchlistWithCuratedCandidates(action, sourceMessage));
+
+  if (options.allowFallback && !normalized.length && isWatchlistPrompt(sourceMessage)) {
+    normalized.push(buildThematicWatchlistAction(sourceMessage));
+  }
+
+  return normalized;
+}
+
+function completeWatchlistWithCuratedCandidates(action, sourceMessage = "") {
+  if (!action || action.type !== "watchlist") return action;
+  const theme = formatWatchlistTheme(action.theme || extractWatchlistTheme(sourceMessage || action.title));
+  const curatedItems = getThemeWatchlistCandidates(theme);
+  if (!curatedItems.length) return action;
+
+  const existingSymbols = new Set(action.items.map((item) => normalizeSymbol(item.ticker)));
+  const mustHave = curatedItems.filter((item) => !existingSymbols.has(normalizeSymbol(item.ticker))).slice(0, Math.max(0, WATCHLIST_ACTION_LIMIT - action.items.length));
+  return {
+    ...action,
+    theme: action.theme || theme,
+    items: [...action.items, ...mustHave].slice(0, WATCHLIST_ACTION_LIMIT),
+  };
+}
+
+function normalizeWatchlistAction(action) {
+  if (!action || action.type !== "watchlist") return null;
+  const theme = formatWatchlistTheme(action.theme || extractWatchlistTheme(action.title) || "Research");
+  const items = (Array.isArray(action.items) ? action.items : [])
+    .map((item) => {
+      const ticker = normalizeSymbol(item.ticker || item.symbol || "");
+      if (!ticker) return null;
+      const assetClass = String(item.assetClass || item.class || "Stocks").trim() || "Stocks";
+      const rawName = String(item.name || item.company || item.companyName || "").trim();
+      const cleanName = cleanCompanyNameCandidate(ticker, rawName) || rawName || getSafeKnownCompanyName(ticker) || ticker;
+      return {
+        ticker,
+        name: cleanName,
+        assetClass,
+        currency: normalizeCurrency(item.currency || inferCurrencyForSymbol(ticker, "", assetClass)),
+        sectorTheme: String(item.sectorTheme || item.theme || theme).trim(),
+        reason: String(item.reason || item.thesis || "Research candidate to review.").trim(),
+        risk: String(item.risk || item.riskNote || "").trim(),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, WATCHLIST_ACTION_LIMIT);
+
+  if (!items.length) return null;
+  return {
+    type: "watchlist",
+    title: String(action.title || `${theme} Research Watchlist`).trim(),
+    theme,
+    items,
+  };
+}
+
+function addWatchlistFromAction(action) {
+  const normalized = normalizeWatchlistAction(action);
+  if (!normalized) return null;
+
+  const now = new Date().toISOString();
+  const signature = getWatchlistSignature(normalized);
+  const existingIndex = state.watchlists.findIndex((watchlist) => getWatchlistSignature(watchlist) === signature || watchlist.title === normalized.title);
+  const existing = existingIndex >= 0 ? state.watchlists[existingIndex] : null;
+  const watchlist = {
+    ...normalized,
+    id: existing?.id || randomId(),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  };
+
+  if (existingIndex >= 0) state.watchlists.splice(existingIndex, 1);
+  state.watchlists = [watchlist, ...state.watchlists].slice(0, 12);
+  watchlist.items.forEach(ensureTickerForWatchlistItem);
+  saveWatchlists();
+  saveTickers();
+  updateTickerCount();
+  return watchlist;
+}
+
+function ensureTickerForWatchlistItem(item) {
+  const symbol = normalizeSymbol(item.ticker || item.symbol);
+  if (!symbol) return;
+  trackedTickers = mergeTickers(trackedTickers, [
+    {
+      symbol,
+      name: item.name || symbol,
+      assetClass: item.assetClass || inferAssetClassFromSymbol(symbol),
+      platform: "Other",
+      currency: item.currency || inferCurrencyForSymbol(symbol, "", item.assetClass),
+      price: 0,
+      dayChangePct: 0,
+      risk: defaultRiskForClass(item.assetClass || inferAssetClassFromSymbol(symbol)),
+    },
+  ]);
+}
+
+function removeWatchlist(id) {
+  state.watchlists = state.watchlists.filter((watchlist) => watchlist.id !== id);
+  saveWatchlists();
+  renderWatchlists();
+}
+
+function getWatchlistSignature(watchlist) {
+  return (watchlist.items || []).map((item) => normalizeSymbol(item.ticker || item.symbol)).filter(Boolean).sort().join("|");
+}
+
+function isWatchlistPrompt(message) {
+  return /watch\s*list|watchlist|shortlist|research\s+list|radar|lista/i.test(String(message || ""));
+}
+
+function extractWatchlistTheme(message) {
+  const cleaned = String(message || "")
+    .replace(/watch\s*list|watchlist/gi, " ")
+    .replace(/\b(build|create|make|give\s+me|find|show|suggest|about|around|for|of|me|a|an|the|stocks?|tickers?|companies|please)\b/gi, " ")
+    .replace(/[^a-z0-9 +&-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "AI stocks";
+}
+
+function buildThematicWatchlistAction(message) {
+  const theme = formatWatchlistTheme(extractWatchlistTheme(message));
+  return normalizeWatchlistAction({
+    type: "watchlist",
+    title: `${theme} Research Watchlist`,
+    theme,
+    items: getThemeWatchlistCandidates(theme),
+  });
+}
+
+function getThemeWatchlistCandidates(theme) {
+  const key = String(theme || "").toLowerCase();
+  if (/cyber|security|seguranca/.test(key)) {
+    return [
+      watchlistCandidate("CRWD", "CrowdStrike Holdings", "Endpoint security and cloud-native threat detection.", "Cybersecurity", "High growth, high valuation sensitivity"),
+      watchlistCandidate("PANW", "Palo Alto Networks", "Large cyber platform with network, cloud, and AI security exposure.", "Cybersecurity", "Execution and valuation risk"),
+      watchlistCandidate("ZS", "Zscaler", "Zero-trust security platform with enterprise cloud exposure.", "Cybersecurity", "High multiple, growth-dependent"),
+      watchlistCandidate("FTNT", "Fortinet", "Profitable security hardware and software platform.", "Cybersecurity", "Hardware cycle sensitivity"),
+      watchlistCandidate("NET", "Cloudflare", "Edge network, security, and developer platform.", "Cybersecurity", "Premium valuation"),
+    ];
+  }
+
+  if (/quantum|qubit|qpu/.test(key)) {
+    return [
+      watchlistCandidate("RGTI", "Rigetti Computing, Inc.", "Pure-play superconducting quantum computing company; this is one of the obvious names to check in quantum watchlists.", "Quantum computing", "Very speculative, revenue and dilution risk"),
+      watchlistCandidate("IONQ", "IonQ, Inc.", "Pure-play trapped-ion quantum platform with cloud access and quantum networking/security exposure.", "Quantum computing", "High valuation and commercialization timing risk"),
+      watchlistCandidate("QBTS", "D-Wave Quantum Inc.", "Pure-play quantum annealing and hybrid quantum solver company.", "Quantum computing", "Very volatile, path-to-profitability risk"),
+      watchlistCandidate("QUBT", "Quantum Computing Inc.", "Small-cap quantum photonics and optimization hardware/software exposure.", "Quantum computing", "Micro/small-cap execution and liquidity risk"),
+      watchlistCandidate("IBM", "International Business Machines Corporation", "Large-cap quantum computing platform with IBM Quantum and enterprise research depth.", "Quantum computing", "Quantum is only a small part of total IBM"),
+      watchlistCandidate("GOOGL", "Alphabet Inc.", "Google Quantum AI gives diversified exposure through a mega-cap with deep quantum research.", "Quantum computing", "Quantum contribution is indirect"),
+      watchlistCandidate("MSFT", "Microsoft Corporation", "Azure Quantum and enterprise quantum ecosystem exposure inside a diversified software/cloud business.", "Quantum computing", "Quantum contribution is indirect"),
+      watchlistCandidate("QTUM", "Defiance Quantum ETF", "ETF-style basket for broader quantum and next-gen computing exposure.", "Quantum computing ETF", "ETF holdings may include broad semis/tech beyond pure quantum"),
+    ];
+  }
+  if (/semi|chip|semiconductor|hardware/.test(key)) {
+    return [
+      watchlistCandidate("NVDA", "NVIDIA Corporation", "AI accelerator leader and data-center GPU benchmark.", "Semiconductors", "Very crowded AI trade"),
+      watchlistCandidate("AMD", "Advanced Micro Devices", "CPU and GPU challenger with AI accelerator ambitions.", "Semiconductors", "Competitive AI execution risk"),
+      watchlistCandidate("TSM", "Taiwan Semiconductor Manufacturing", "Critical foundry for advanced AI chips.", "Semiconductors", "Geopolitical concentration risk"),
+      watchlistCandidate("ASML", "ASML Holding", "EUV lithography supplier for advanced semiconductor manufacturing.", "Semiconductors", "Cyclical capex risk"),
+      watchlistCandidate("AVGO", "Broadcom Inc.", "Networking silicon and custom AI accelerator exposure.", "Semiconductors", "Integration and cycle risk"),
+      watchlistCandidate("MU", "Micron Technology", "Memory supplier exposed to AI server demand.", "Semiconductors", "Highly cyclical earnings"),
+    ];
+  }
+
+  if (/crypto|bitcoin|blockchain/.test(key)) {
+    return [
+      watchlistCandidate("COIN", "Coinbase Global", "Crypto exchange and custody infrastructure exposure.", "Crypto infrastructure", "Regulatory and crypto-cycle risk"),
+      watchlistCandidate("MSTR", "MicroStrategy", "High beta Bitcoin treasury exposure.", "Crypto infrastructure", "Very high volatility"),
+      watchlistCandidate("HOOD", "Robinhood Markets", "Retail trading platform with crypto revenue exposure.", "Trading platforms", "Retail activity sensitivity"),
+      watchlistCandidate("IBIT", "iShares Bitcoin Trust", "Spot Bitcoin ETF exposure without exchange operating risk.", "Crypto", "Bitcoin price volatility"),
+    ];
+  }
+
+  if (/dividend|income|yield/.test(key)) {
+    return [
+      watchlistCandidate("JNJ", "Johnson & Johnson", "Defensive healthcare dividend compounder.", "Healthcare", "Legal and pipeline risk"),
+      watchlistCandidate("PG", "Procter & Gamble", "Consumer staples dividend quality.", "Consumer staples", "Slower growth profile"),
+      watchlistCandidate("KO", "Coca-Cola", "Global beverage cash-flow profile.", "Consumer staples", "Valuation and FX sensitivity"),
+      watchlistCandidate("PEP", "PepsiCo", "Snacks and beverages with dividend history.", "Consumer staples", "Margin pressure risk"),
+      watchlistCandidate("MCD", "McDonald's", "Global franchise cash-flow model.", "Consumer discretionary", "Consumer slowdown risk"),
+    ];
+  }
+
+  if (/energy|renewable|solar|clean/.test(key)) {
+    return [
+      watchlistCandidate("XOM", "Exxon Mobil", "Integrated energy major with cash-flow scale.", "Energy", "Oil and gas cycle risk"),
+      watchlistCandidate("CVX", "Chevron", "Integrated energy major with shareholder return focus.", "Energy", "Commodity price risk"),
+      watchlistCandidate("NEE", "NextEra Energy", "Utility and renewables exposure.", "Utilities", "Rates and project execution risk"),
+      watchlistCandidate("FSLR", "First Solar", "US solar manufacturing and utility-scale solar exposure.", "Clean energy", "Policy and margin risk"),
+      watchlistCandidate("ENPH", "Enphase Energy", "Solar inverter and home energy systems.", "Clean energy", "Residential solar cycle risk"),
+    ];
+  }
+
+  return [
+    watchlistCandidate("NVDA", "NVIDIA Corporation", "Core AI compute and accelerator exposure.", "AI", "Very crowded AI trade"),
+    watchlistCandidate("MSFT", "Microsoft Corporation", "Cloud AI platform plus enterprise AI distribution through Azure and Copilot.", "AI", "Mega-cap valuation risk"),
+    watchlistCandidate("GOOGL", "Alphabet Inc.", "AI research, search, ads, cloud, and custom TPU infrastructure.", "AI", "Search disruption and regulation"),
+    watchlistCandidate("AMD", "Advanced Micro Devices", "AI accelerator challenger with data-center growth optionality.", "AI semiconductors", "Competitive execution risk"),
+    watchlistCandidate("TSM", "Taiwan Semiconductor Manufacturing", "Manufactures leading-edge chips used by AI leaders.", "AI semiconductors", "Geopolitical concentration risk"),
+    watchlistCandidate("ASML", "ASML Holding", "EUV lithography supplier enabling advanced AI chips.", "AI semiconductors", "Cyclical capex risk"),
+    watchlistCandidate("AVGO", "Broadcom Inc.", "Networking and custom silicon for AI infrastructure.", "AI infrastructure", "Integration and cycle risk"),
+    watchlistCandidate("META", "Meta Platforms", "AI-driven ads, recommendation systems, and open AI model strategy.", "AI platforms", "Regulatory and capex risk"),
+  ];
+}
+
+function watchlistCandidate(ticker, name, reason, sectorTheme, risk) {
+  return { ticker, name, reason, sectorTheme, risk, assetClass: "Stocks", currency: "USD" };
+}
+
+function formatWatchlistTheme(value) {
+  const text = String(value || "Research").trim().replace(/\s+/g, " ");
+  return text.split(" ").map((word) => {
+    if (/^ai$/i.test(word)) return "AI";
+    if (/^etf$/i.test(word)) return "ETF";
+    return `${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`;
+  }).join(" ");
+}
+
+function formatWatchlistDate(value) {
+  const date = new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) return "Today";
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date);
+}
 function getHoldingTableRows(sourceHoldings) {
   return sourceHoldings
     .map((holding) => ({
@@ -863,15 +1534,23 @@ function openStockAnalysis(symbol) {
   if (!normalized) return;
 
   state.selectedStockSymbol = normalized;
+  state.stockChartHoverX = null;
   const holding = getHoldingForAnalysis(normalized);
   renderStockAnalysisModal(normalized, holding, state.stockAnalysis[normalized] || null, true);
   openModal("stockModal");
+  resetStockModalScroll();
   setStatus("stockAnalysisStatus", "Fetching market data...", "");
+  refreshNewsSentimentForSymbols([normalized], { quiet: true });
+  loadStockChartSeriesForSymbol(normalized, holding);
 
-  fetchStockAnalysisData(normalized, holding)
+  refreshQuoteForSymbol(normalized, holding).catch(() => null);
+
+  fetchStockAnalysisData(normalized, getHoldingForAnalysis(normalized), { force: true })
     .then((analysis) => {
       if (state.selectedStockSymbol !== normalized) return;
       state.stockAnalysis[normalized] = analysis;
+      saveHoldings();
+      saveTickers();
       saveStockAnalysisCache();
       if (analysis.name) applyTickerName(normalized, analysis.name);
       renderStockAnalysisModal(normalized, getHoldingForAnalysis(normalized), analysis, false);
@@ -905,6 +1584,13 @@ function renderStockAnalysisModal(symbol, holding, analysis, loading) {
   document.getElementById("stockAnalysisContent").innerHTML = renderStockAnalysisContent(normalized, holding, merged, loading);
   const manualInput = document.getElementById("stockManualYahooUrl");
   if (manualInput) manualInput.value = state.manualYahooLinks[normalized]?.url || "";
+}
+
+function resetStockModalScroll() {
+  window.setTimeout(() => {
+    document.querySelector("#stockModal .modal-panel")?.scrollTo({ top: 0, left: 0 });
+    document.getElementById("stockAnalysisContent")?.scrollTo({ top: 0, left: 0 });
+  }, 0);
 }
 
 function saveManualYahooLinkFromModal() {
@@ -946,6 +1632,8 @@ function saveManualYahooLinkFromModal() {
     .then((analysis) => {
       if (state.selectedStockSymbol !== symbol) return;
       state.stockAnalysis[symbol] = analysis;
+      saveHoldings();
+      saveTickers();
       saveStockAnalysisCache();
       if (analysis.name) applyTickerName(symbol, analysis.name);
       renderStockAnalysisModal(symbol, getHoldingForAnalysis(symbol), analysis, false);
@@ -1000,15 +1688,21 @@ function renderStockAnalysisContent(symbol, holding, data, loading) {
   const gainPct = safePercent(gain, investedValue);
   const dayGain = open ? marketValue * ((Number(holding.dayChangePct) || 0) / 100) : 0;
   const weight = safePercent(marketValue, getTotalValue());
-  const transactionsForSymbol = state.transactions.filter((transaction) => transaction.symbol === symbol);
-  const buys = transactionsForSymbol.filter((transaction) => transaction.type === "buy").length;
-  const sells = transactionsForSymbol.filter((transaction) => transaction.type === "sell").length;
-  const dividends = transactionsForSymbol.filter((transaction) => transaction.type === "dividend").length;
-  const price = Number(data.regularMarketPrice ?? data.price ?? holding.price) || 0;
-  const currency = normalizeCurrency(data.currency || holding.currency || BASE_CURRENCY);
-  const dayChangePct = Number(data.regularMarketChangePercent ?? data.dayChangePct ?? holding.dayChangePct) || 0;
+  const transactionsForSymbol = state.transactions.filter((transaction) => normalizeSymbol(transaction.symbol) === symbol);
+  const price = firstForecastNumber(holding.price, data.regularMarketPrice, data.price) || 0;
+  const currency = normalizeCurrency(holding.currency || data.currency || BASE_CURRENCY);
+  const dayChangePct = Number(holding.dayChangePct ?? data.regularMarketChangePercent ?? data.dayChangePct) || 0;
   const dayChange = Number(data.regularMarketChange) || 0;
-  const notes = buildStockAnalysisNotes({ holding, data, open, weight, gainPct, dayChangePct, transactionsForSymbol });
+  const liveData = {
+    ...data,
+    currency,
+    regularMarketPrice: price,
+    price,
+    regularMarketChangePercent: dayChangePct,
+    dayChangePct,
+  };
+  const forecast = buildAnalystForecast(symbol, holding, liveData);
+  const notes = buildStockAnalysisNotes({ holding, data: liveData, open, weight, gainPct, dayChangePct, transactionsForSymbol });
 
   return `
     <div class="stock-analysis-grid">
@@ -1028,40 +1722,297 @@ function renderStockAnalysisContent(symbol, holding, data, loading) {
         <span class="${dayChangePct >= 0 ? "positive" : "negative"}">${formatSignedPercent(dayChangePct)} today${dayChange ? ` | ${formatMoney(dayChange, currency)}` : ""}</span>
       </article>
       <article class="analysis-card">
-        <p>Activity</p>
-        <strong>${transactionsForSymbol.length}</strong>
-        <span>${buys} buys | ${sells} sells | ${dividends} dividends</span>
+        <p>Avg forecast</p>
+        <strong>${forecast.averageLabel || "--"}</strong>
+        <span class="${Number(forecast.averageChangePct) >= 0 ? "positive" : "negative"}">${Number.isFinite(forecast.averageChangePct) ? `${formatForecastPercent(forecast.averageChangePct)} vs market` : "No analyst average yet"}</span>
       </article>
     </div>
 
-    ${renderCompanyProfilePanel(symbol, holding, data)}
+    ${renderStockPriceChartPanel(symbol, holding, liveData)}
 
-    ${renderAnalystForecastPanel(symbol, holding, data)}
+    ${renderCompanyProfilePanel(symbol, holding, liveData)}
+
+    ${renderAnalystForecastPanel(symbol, holding, liveData)}
+
+    ${renderNewsSentimentPanel(symbol)}
 
     <div class="stock-data-grid">
-      ${renderDataPoint("Name", data.name || getKnownCompanyName(symbol, holding) || "--")}
-      ${renderDataPoint("Exchange", data.fullExchangeName || data.exchange || "--")}
-      ${renderDataPoint("Sector", data.sector || "--")}
-      ${renderDataPoint("Industry", data.industry || "--")}
+      ${renderDataPoint("Name", liveData.name || getKnownCompanyName(symbol, holding) || "--")}
+      ${renderDataPoint("Exchange", liveData.fullExchangeName || liveData.exchange || "--")}
+      ${renderDataPoint("Sector", liveData.sector || "--")}
+      ${renderDataPoint("Industry", liveData.industry || "--")}
       ${renderDataPoint("Currency", currency)}
-      ${renderDataPoint("Market cap", formatLargeNumber(data.marketCap, currency))}
-      ${renderDataPoint("P/E", formatMaybeNumber(data.trailingPE ?? data.forwardPE))}
-      ${renderDataPoint("Analysts", data.analystView || "--")}
-      ${renderDataPoint("Price target", data.priceTarget || "--")}
-      ${renderDataPoint("Target range", formatTargetRange(data.targetLow, data.targetHigh))}
-      ${renderDataPoint("Analyst count", data.analystCount || "--")}
-      ${renderDataPoint("Earnings", data.nextEarningsDate || "--")}
-      ${renderDataPoint("Ex-dividend", data.exDividendDate || "--")}
-      ${renderDataPoint("Dividend date", data.nextDividendDate || "--")}
-      ${renderDataPoint("Dividend yield", data.dividendYield || "--")}
-      ${renderDataPoint("52W range", formatRange(data.fiftyTwoWeekLow, data.fiftyTwoWeekHigh, currency))}
-      ${renderDataPoint("Avg volume", formatLargeNumber(data.averageDailyVolume3Month || data.averageDailyVolume10Day, ""))}
-      ${renderDataPoint("Source", data.source || (loading ? "Loading" : "Local portfolio"))}
+      ${renderDataPoint("Market cap", formatLargeNumber(liveData.marketCap, currency))}
+      ${renderDataPoint("P/E", formatMaybeNumber(liveData.trailingPE ?? liveData.forwardPE))}
+      ${renderDataPoint("Analysts", liveData.analystView || "--")}
+      ${renderDataPoint("Price target", liveData.priceTarget || "--")}
+      ${renderDataPoint("Target range", formatTargetRange(liveData.targetLow, liveData.targetHigh))}
+      ${renderDataPoint("Analyst count", liveData.analystCount || "--")}
+      ${renderDataPoint("Earnings", liveData.nextEarningsDate || "--")}
+      ${renderDataPoint("Ex-dividend", liveData.exDividendDate || "--")}
+      ${renderDataPoint("Dividend date", liveData.nextDividendDate || "--")}
+      ${renderDataPoint("Dividend yield", liveData.dividendYield || "--")}
+      ${renderDataPoint("52W range", formatRange(liveData.fiftyTwoWeekLow, liveData.fiftyTwoWeekHigh, currency))}
+      ${renderDataPoint("Avg volume", formatLargeNumber(liveData.averageDailyVolume3Month || liveData.averageDailyVolume10Day, ""))}
+      ${renderDataPoint("Source", liveData.source || (loading ? "Loading" : "Local portfolio"))}
     </div>
 
     <div class="analysis-notes">
       ${notes.map((note) => `<p>${escapeHtml(note)}</p>`).join("")}
     </div>
+
+    ${renderStockTransactionsPanel(symbol, transactionsForSymbol)}
+  `;
+}
+
+async function loadStockChartSeriesForSymbol(symbol, holding = {}) {
+  const normalized = normalizeSymbol(symbol);
+  const cached = state.stockChartSeries[normalized];
+  if (cached?.points?.length && Date.now() - Number(cached.fetchedAt || 0) < 30 * 60 * 1000) return;
+
+  state.stockChartSeries[normalized] = { ...(cached || {}), loading: true, error: "" };
+  renderStockAnalysisModal(normalized, getHoldingForAnalysis(normalized), state.stockAnalysis[normalized] || null, false);
+
+  try {
+    const series = await fetchStockHistorySeries(normalized, holding);
+    state.stockChartSeries[normalized] = { ...series, loading: false, fetchedAt: Date.now(), error: "" };
+  } catch (error) {
+    state.stockChartSeries[normalized] = {
+      points: cached?.points || [],
+      currency: holding.currency || BASE_CURRENCY,
+      sourceSymbol: "",
+      loading: false,
+      fetchedAt: Date.now(),
+      error: error.message || "Could not load chart data.",
+    };
+  }
+
+  if (state.selectedStockSymbol === normalized) {
+    renderStockAnalysisModal(normalized, getHoldingForAnalysis(normalized), state.stockAnalysis[normalized] || null, false);
+  }
+}
+
+async function fetchStockHistorySeries(symbol, holding = {}) {
+  const candidates = buildQuoteCandidates({ ...holding, symbol });
+  const response = await fetch(getStockHistoryEndpoint(candidates), { cache: "no-store" });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Stock history server returned HTTP ${response.status}`);
+
+  const points = (Array.isArray(data.points) ? data.points : [])
+    .map((point) => {
+      const time = Date.parse(point.date);
+      return {
+        date: Number.isFinite(time) ? new Date(time).toISOString() : "",
+        value: Number(point.value),
+      };
+    })
+    .filter((point) => point.date && Number.isFinite(point.value) && point.value > 0);
+
+  if (points.length < 2) throw new Error("No historical prices found.");
+  return {
+    points,
+    currency: normalizeCurrency(data.currency || holding.currency || BASE_CURRENCY),
+    sourceSymbol: data.sourceSymbol || "",
+    source: data.source || "Stooq",
+  };
+}
+
+function getStockHistoryEndpoint(candidates) {
+  const params = new URLSearchParams({
+    candidates: candidates
+      .slice(0, 12)
+      .map((candidate) => `${candidate.symbol}:${candidate.currency}`)
+      .join(","),
+    days: "760",
+  });
+  const path = `/api/stock-history?${params.toString()}`;
+  if (/^https?:$/i.test(window.location.protocol)) return path;
+  return `http://localhost:8787${path}`;
+}
+
+function renderStockPriceChartPanel(symbol, holding, data) {
+  const normalized = normalizeSymbol(symbol);
+  const series = state.stockChartSeries[normalized] || {};
+  const rawPoints = Array.isArray(series.points) ? series.points : [];
+  const points = filterStockChartPoints(rawPoints, state.stockChartPeriod);
+  const currency = normalizeCurrency(series.currency || data.currency || holding.currency || BASE_CURRENCY);
+  const periods = ["1M", "3M", "6M", "1Y", "2Y"];
+
+  if (series.loading && points.length < 2) {
+    return `
+      <section class="stock-chart-card">
+        <div class="stock-chart-header">
+          <div>
+            <h4>Price Chart</h4>
+            <p>Loading real historical prices...</p>
+          </div>
+          <span class="status-spinner" aria-hidden="true"></span>
+        </div>
+        <div class="stock-chart-empty">Fetching market history for ${escapeHtml(normalized)}.</div>
+      </section>
+    `;
+  }
+
+  if (points.length < 2) {
+    return `
+      <section class="stock-chart-card">
+        <div class="stock-chart-header">
+          <div>
+            <h4>Price Chart</h4>
+            <p>${escapeHtml(series.error || "No historical prices loaded yet.")}</p>
+          </div>
+          <button class="secondary-button compact-button" type="button" data-reload-stock-chart="${escapeAttribute(normalized)}">Retry</button>
+        </div>
+        <div class="stock-chart-empty">No chart is available for ${escapeHtml(normalized)} yet.</div>
+      </section>
+    `;
+  }
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  const changePct = safePercent(last.value - first.value, first.value);
+  const sourceLabel = series.sourceSymbol ? `${series.source || "Stooq"} ${series.sourceSymbol}` : (series.source || "Historical prices");
+
+  return `
+    <section class="stock-chart-card">
+      <div class="stock-chart-header">
+        <div>
+          <h4>Price Chart</h4>
+          <p>${escapeHtml(sourceLabel)} | ${points.length} sessions</p>
+        </div>
+        <div class="stock-chart-actions">
+          ${series.loading ? `<span class="status-spinner" aria-hidden="true"></span>` : ""}
+          <div class="segmented-control compact stock-chart-periods" role="tablist" aria-label="Stock chart period">
+            ${periods.map((period) => `<button type="button" class="${period === state.stockChartPeriod ? "active" : ""}" data-stock-chart-period="${period}">${period}</button>`).join("")}
+          </div>
+        </div>
+      </div>
+      <div class="stock-chart-metrics">
+        <strong>${formatMoney(last.value, currency)}</strong>
+        <span class="${changePct >= 0 ? "positive" : "negative"}">${formatSignedPercent(changePct)} over ${escapeHtml(state.stockChartPeriod)}</span>
+      </div>
+      ${renderStockChartSvg(points, currency)}
+    </section>
+  `;
+}
+
+function filterStockChartPoints(points, period) {
+  const days = { "1M": 31, "3M": 93, "6M": 186, "1Y": 366, "2Y": 760 }[period] || 186;
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const filtered = points.filter((point) => new Date(point.date).getTime() >= cutoff);
+  return filtered.length >= 2 ? filtered : points.slice(-Math.min(points.length, 160));
+}
+
+function renderStockChartSvg(points, currency) {
+  const width = 760;
+  const height = 260;
+  const padding = { top: 18, right: 58, bottom: 34, left: 58 };
+  const values = points.map((point) => point.value);
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const range = Math.max(0.0001, maxValue - minValue);
+  const yMin = minValue - range * 0.08;
+  const yMax = maxValue + range * 0.08;
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const xFor = (index) => padding.left + (points.length === 1 ? 0 : index / (points.length - 1)) * plotWidth;
+  const yFor = (value) => padding.top + (yMax - value) / Math.max(0.0001, yMax - yMin) * plotHeight;
+  const path = points.map((point, index) => `${index ? "L" : "M"}${xFor(index).toFixed(1)} ${yFor(point.value).toFixed(1)}`).join(" ");
+  const area = `${path} L${xFor(points.length - 1).toFixed(1)} ${height - padding.bottom} L${padding.left} ${height - padding.bottom} Z`;
+  const hoverX = Number.isFinite(state.stockChartHoverX) ? clamp(state.stockChartHoverX, padding.left, width - padding.right) : null;
+  const hoverIndex = hoverX === null ? points.length - 1 : Math.round((hoverX - padding.left) / plotWidth * (points.length - 1));
+  const hoverPoint = points[clamp(hoverIndex, 0, points.length - 1)];
+  const hoverPointX = xFor(points.indexOf(hoverPoint));
+  const hoverPointY = yFor(hoverPoint.value);
+  const grid = [0, 1, 2, 3].map((index) => {
+    const y = padding.top + index * (plotHeight / 3);
+    const value = yMax - index * ((yMax - yMin) / 3);
+    return `
+      <line class="stock-chart-grid" x1="${padding.left}" y1="${y.toFixed(1)}" x2="${width - padding.right}" y2="${y.toFixed(1)}"></line>
+      <text class="stock-chart-axis" x="${width - padding.right + 10}" y="${(y + 4).toFixed(1)}">${escapeHtml(formatCompactPrice(value, currency))}</text>
+    `;
+  }).join("");
+
+  return `
+    <div class="stock-chart-wrap" data-stock-chart>
+      <svg class="stock-price-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Interactive historical price chart">
+        <defs>
+          <linearGradient id="stockChartFill" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stop-color="#0f766e" stop-opacity="0.22"></stop>
+            <stop offset="100%" stop-color="#0f766e" stop-opacity="0"></stop>
+          </linearGradient>
+        </defs>
+        ${grid}
+        <path class="stock-chart-area" d="${area}"></path>
+        <path class="stock-chart-line" d="${path}"></path>
+        <line class="stock-chart-hover-line" x1="${hoverPointX.toFixed(1)}" y1="${padding.top}" x2="${hoverPointX.toFixed(1)}" y2="${height - padding.bottom}"></line>
+        <circle class="stock-chart-hover-dot" cx="${hoverPointX.toFixed(1)}" cy="${hoverPointY.toFixed(1)}" r="5"></circle>
+        <text class="stock-chart-axis" x="${padding.left}" y="${height - 10}">${escapeHtml(formatStockChartDate(points[0].date))}</text>
+        <text class="stock-chart-axis" x="${width - padding.right - 42}" y="${height - 10}">${escapeHtml(formatStockChartDate(points[points.length - 1].date))}</text>
+      </svg>
+      <div class="stock-chart-tooltip" style="left:${safePercent(hoverPointX - padding.left, plotWidth)}%">
+        <strong>${escapeHtml(formatMoney(hoverPoint.value, currency))}</strong>
+        <span>${escapeHtml(formatStockChartDate(hoverPoint.date))}</span>
+      </div>
+    </div>
+  `;
+}
+
+function formatCompactPrice(value, currency) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  if (number >= 1000) return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(number);
+  return formatMoney(number, currency).replace(/\s/g, "");
+}
+
+function formatStockChartDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(date);
+}
+
+function renderStockTransactionsPanel(symbol, transactionsForSymbol) {
+  const rows = [...transactionsForSymbol].sort(compareTransactionsDesc);
+  return `
+    <section class="stock-transactions-card">
+      <div class="stock-transactions-header">
+        <div>
+          <h4>Transactions</h4>
+          <p>${rows.length} ${rows.length === 1 ? "entry" : "entries"} for ${escapeHtml(symbol)}</p>
+        </div>
+      </div>
+      <div class="stock-transactions-table-wrap">
+        <table class="stock-transactions-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Type</th>
+              <th class="number">Qty</th>
+              <th class="number">Price</th>
+              <th class="number">Fees</th>
+              <th class="number">Impact</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.length ? rows.map(renderStockTransactionRow).join("") : `<tr><td colspan="6">No transactions recorded for this ticker.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderStockTransactionRow(transaction) {
+  const impact = Number(transaction.cashImpactEUR) || toEUR(getCashImpact(transaction.type, transaction.quantity, transaction.price, transaction.fees), transaction.currency || BASE_CURRENCY);
+  return `
+    <tr>
+      <td>${escapeHtml(formatTransactionDate(transaction))}</td>
+      <td><span class="pill">${escapeHtml(capitalize(transaction.type || "entry"))}</span></td>
+      <td class="number">${formatQuantity(transaction.quantity)}</td>
+      <td class="number">${formatMoney(transaction.price || 0, transaction.currency || BASE_CURRENCY)}</td>
+      <td class="number">${formatMoney(transaction.fees || 0, transaction.currency || BASE_CURRENCY)}</td>
+      <td class="number ${impact >= 0 ? "positive" : "negative"}">${formatSignedEUR(impact)}</td>
+    </tr>
   `;
 }
 
@@ -1187,6 +2138,315 @@ function buildAnalystForecast(symbol, holding, data) {
     fiftyTwoWeekHigh: firstForecastNumber(data.fiftyTwoWeekHigh),
     hasForecast: [low, average, median, high].some((value) => Number.isFinite(value) && value > 0),
   };
+}
+
+async function refreshNewsSentiment({ quiet = false, force = false } = {}) {
+  const symbols = getNewsSentimentSymbols();
+  await refreshNewsSentimentForSymbols(symbols, { quiet, force });
+}
+
+async function refreshNewsSentimentForSymbols(symbols, { quiet = false, force = false } = {}) {
+  const uniqueSymbols = [...new Set((symbols || []).map(normalizeSymbol).filter((symbol) => symbol && symbol !== "CASH"))];
+  const staleSymbols = force ? uniqueSymbols : uniqueSymbols.filter((symbol) => !isNewsSentimentFresh(state.newsSentiment[symbol]));
+
+  if (!uniqueSymbols.length) {
+    state.newsSentimentMessage = "Add open stock positions to check headline risk.";
+    renderMarketStatus();
+    renderInvestorProfile();
+    return;
+  }
+
+  if (!staleSymbols.length) {
+    state.newsSentimentMessage = "";
+    renderMarketStatus();
+    renderInvestorProfile();
+    return;
+  }
+
+  state.newsSentimentLoading = true;
+  state.newsSentimentMessage = `Checking recent headlines for ${staleSymbols.length} ticker${staleSymbols.length === 1 ? "" : "s"}...`;
+  renderMarketStatus();
+  renderInvestorProfile();
+
+  try {
+    const data = await requestNewsSentiment(staleSymbols);
+    (data.items || []).forEach((item) => {
+      const normalized = normalizeNewsSentimentItem(item, data.generatedAt);
+      if (normalized.symbol) state.newsSentiment[normalized.symbol] = normalized;
+    });
+    saveNewsSentimentCache();
+    state.newsSentimentMessage = "";
+  } catch (error) {
+    state.newsSentimentMessage = quiet
+      ? "News sentiment needs the local server."
+      : `News sentiment unavailable: ${error.message || "Start the local server and try again."}`;
+  } finally {
+    state.newsSentimentLoading = false;
+    renderMarketStatus();
+    renderInvestorProfile();
+    if (state.selectedStockSymbol && staleSymbols.includes(state.selectedStockSymbol)) {
+      renderStockAnalysisModal(state.selectedStockSymbol, getHoldingForAnalysis(state.selectedStockSymbol), state.stockAnalysis[state.selectedStockSymbol] || null, false);
+    }
+  }
+}
+
+async function requestNewsSentiment(symbols) {
+  const response = await fetch(getNewsSentimentEndpoint(symbols), { cache: "no-store" });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `News server returned HTTP ${response.status}`);
+  return data;
+}
+
+function getNewsSentimentEndpoint(symbols) {
+  const params = new URLSearchParams({
+    symbols: symbols.map(normalizeSymbol).filter(Boolean).join(","),
+    days: "7",
+  });
+  const path = `/api/news-sentiment?${params.toString()}`;
+  if (/^https?:$/i.test(window.location.protocol)) return path;
+  return `http://localhost:8787${path}`;
+}
+
+function getNewsSentimentSymbols() {
+  return uniqueBy(
+    getVisibleHoldings()
+      .filter((holding) => holding.symbol && holding.symbol !== "CASH")
+      .sort((a, b) => getMarketValue(b) - getMarketValue(a)),
+    (holding) => holding.symbol,
+  )
+    .slice(0, 24)
+    .map((holding) => holding.symbol);
+}
+
+function isNewsSentimentFresh(item) {
+  return item && Date.now() - Number(item.fetchedAt || 0) < NEWS_SENTIMENT_REFRESH_MS;
+}
+
+function normalizeNewsSentimentItem(item, generatedAt = "") {
+  const symbol = normalizeSymbol(item?.symbol);
+  const riskScore = clamp(Number(item?.riskScore) || 50, 0, 100);
+  const headlines = Array.isArray(item?.headlines) ? item.headlines : [];
+
+  return {
+    symbol,
+    sentiment: String(item?.sentiment || "Unavailable").trim(),
+    sentimentScore: Number(item?.sentimentScore) || 0,
+    riskScore,
+    riskLevel: String(item?.riskLevel || getNewsRiskLevel(riskScore)).trim(),
+    riskFlags: normalizeStringArray(item?.riskFlags).slice(0, 8),
+    positiveCount: Number(item?.positiveCount) || 0,
+    negativeCount: Number(item?.negativeCount) || 0,
+    headlines: headlines.slice(0, 8).map((headline) => ({
+      title: String(headline?.title || "").trim(),
+      source: String(headline?.source || "").trim(),
+      url: String(headline?.url || "").trim(),
+      publishedAt: String(headline?.publishedAt || "").trim(),
+      sentiment: String(headline?.sentiment || "").trim(),
+      sentimentScore: Number(headline?.sentimentScore) || 0,
+      riskTags: normalizeStringArray(headline?.riskTags).slice(0, 5),
+    })).filter((headline) => headline.title),
+    error: String(item?.error || "").trim(),
+    generatedAt: generatedAt || item?.generatedAt || new Date().toISOString(),
+    fetchedAt: Number(item?.fetchedAt) || Date.now(),
+  };
+}
+
+function normalizeStringArray(value) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+function getNewsSentimentForSymbol(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const baseSymbol = getBaseTickerSymbol(normalized);
+  return state.newsSentiment[normalized] || state.newsSentiment[baseSymbol] || null;
+}
+
+function buildPortfolioNewsRisk() {
+  const rows = getNewsRiskRows();
+  const totalValue = getTotalValue();
+  const coveredRows = rows.filter((row) => row.news && row.news.headlines.length);
+  const coveredValue = coveredRows.reduce((sum, row) => sum + row.marketValue, 0);
+  const coverage = safePercent(coveredValue, totalValue);
+  const latest = rows
+    .map((row) => row.news?.fetchedAt || 0)
+    .filter(Boolean)
+    .sort((a, b) => b - a)[0];
+
+  if (!rows.length) {
+    return {
+      title: "Portfolio news risk",
+      hasCoverage: false,
+      score: 0,
+      level: "Risk score",
+      detail: "No open positions",
+      summary: "Add open stock positions to check recent headline sentiment.",
+      updatedLabel: "Not loaded",
+      rows: [],
+      emptyMessage: "No open holdings are available for news scanning.",
+    };
+  }
+
+  if (!coveredRows.length) {
+    return {
+      title: "Portfolio news risk",
+      hasCoverage: false,
+      score: 0,
+      level: "Risk score",
+      detail: "No headline coverage yet",
+      summary: "Refresh news to scan recent headlines through the local server.",
+      updatedLabel: latest ? `Checked ${formatNewsTime(latest)}` : "Not loaded",
+      rows,
+      emptyMessage: "Refresh news to populate sentiment for your holdings.",
+    };
+  }
+
+  const weightedRisk = coveredRows.reduce((sum, row) => sum + row.news.riskScore * safeRatio(row.marketValue, coveredValue), 0);
+  const score = Math.round(weightedRisk);
+  const riskiest = [...coveredRows]
+    .sort((a, b) => (b.news.riskScore * b.weight) - (a.news.riskScore * a.weight))
+    .slice(0, 3)
+    .map((row) => `${row.symbol} ${row.news.riskLevel.toLowerCase()}`);
+
+  return {
+    title: "Portfolio news risk",
+    hasCoverage: true,
+    score,
+    level: getNewsRiskLevel(score),
+    detail: `${formatPercent(coverage)} headline coverage`,
+    summary: `Weighted headline risk is ${getNewsRiskLevel(score).toLowerCase()} across ${formatPercent(coverage)} of open value. Highest weighted signals: ${riskiest.join(", ")}.`,
+    updatedLabel: latest ? `Checked ${formatNewsTime(latest)}` : "Not loaded",
+    rows,
+    emptyMessage: "Refresh news to populate sentiment for your holdings.",
+  };
+}
+
+function getNewsRiskRows() {
+  const totalValue = getTotalValue();
+  return getVisibleHoldings()
+    .filter((holding) => holding.symbol && holding.symbol !== "CASH")
+    .map((holding) => {
+      const marketValue = getMarketValue(holding);
+      const news = getNewsSentimentForSymbol(holding.symbol);
+      return {
+        symbol: holding.symbol,
+        name: getKnownCompanyName(holding.symbol, holding) || holding.name || holding.symbol,
+        holding,
+        marketValue,
+        weight: safePercent(marketValue, totalValue),
+        news,
+      };
+    })
+    .sort((a, b) => {
+      const aRisk = a.news?.riskScore ?? -1;
+      const bRisk = b.news?.riskScore ?? -1;
+      return (bRisk * b.weight) - (aRisk * a.weight);
+    });
+}
+
+function renderNewsSentimentPanel(symbol) {
+  const item = getNewsSentimentForSymbol(symbol);
+  if (!item) {
+    return `
+      <section class="news-sentiment-card news-sentiment-empty">
+        <div class="news-sentiment-heading">
+          <div>
+            <h4>News Sentiment</h4>
+            <p>Not loaded</p>
+          </div>
+          <button class="secondary-button compact-button" type="button" data-refresh-stock-news="${escapeAttribute(symbol)}">Refresh news</button>
+        </div>
+        <p>Refresh news to see recent headline sentiment for ${escapeHtml(symbol)}.</p>
+      </section>
+    `;
+  }
+
+  const headlines = item.headlines.slice(0, 5);
+  const isLoading = state.newsSentimentLoading && normalizeSymbol(state.selectedStockSymbol) === normalizeSymbol(symbol);
+  return `
+    <section class="news-sentiment-card">
+      <div class="news-sentiment-heading">
+        <div>
+          <h4>News Sentiment</h4>
+          <p>${escapeHtml(formatNewsTime(item.fetchedAt))}</p>
+        </div>
+        <div class="news-sentiment-badges">
+          <span class="sentiment-pill ${sentimentClass(item.sentiment)}">${escapeHtml(item.sentiment)}</span>
+          <span class="risk-pill ${newsRiskClass(item.riskScore)}">${escapeHtml(item.riskLevel)} risk ${item.riskScore} / 100</span>
+          <button class="secondary-button compact-button" type="button" data-refresh-stock-news="${escapeAttribute(symbol)}" ${isLoading ? "disabled" : ""}>${isLoading ? "Refreshing" : "Refresh news"}</button>
+        </div>
+      </div>
+      ${item.riskFlags.length ? `<div class="news-tags">${item.riskFlags.map((flag) => `<span class="news-tag">${escapeHtml(flag)}</span>`).join("")}</div>` : ""}
+      <div class="news-headline-list">
+        ${headlines.length ? headlines.map(renderStockNewsHeadline).join("") : `<p class="muted-text">${escapeHtml(item.error || "No recent headline found for this ticker.")}</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderStockNewsHeadline(headline) {
+  const meta = [headline.source, formatNewsPublishedAt(headline.publishedAt), headline.sentiment].filter(Boolean).join(" | ");
+  const title = escapeHtml(headline.title);
+  const content = headline.url
+    ? `<a href="${escapeAttribute(headline.url)}" target="_blank" rel="noopener noreferrer">${title}</a>`
+    : `<strong>${title}</strong>`;
+
+  return `
+    <article class="news-headline-item">
+      ${content}
+      <span>${escapeHtml(meta)}</span>
+    </article>
+  `;
+}
+
+function getNewsRiskLevel(score) {
+  const number = Number(score);
+  if (!Number.isFinite(number)) return "Unknown";
+  if (number >= 72) return "High";
+  if (number >= 56) return "Elevated";
+  if (number >= 38) return "Moderate";
+  return "Quiet";
+}
+
+function newsRiskClass(score) {
+  const number = Number(score);
+  if (!Number.isFinite(number)) return "risk-unknown";
+  if (number >= 72) return "risk-high";
+  if (number >= 56) return "risk-elevated";
+  if (number >= 38) return "risk-moderate";
+  return "risk-quiet";
+}
+
+function sentimentClass(value) {
+  const normalized = String(value || "").toLowerCase();
+  if (normalized.includes("positive")) return "sentiment-positive";
+  if (normalized.includes("cautious")) return "sentiment-cautious";
+  if (normalized.includes("mixed")) return "sentiment-mixed";
+  if (normalized.includes("unavailable") || normalized.includes("not checked")) return "sentiment-unavailable";
+  return "sentiment-neutral";
+}
+
+function formatNewsTime(value) {
+  const date = typeof value === "number" ? new Date(value) : new Date(value);
+  if (Number.isNaN(date.getTime())) return "Not loaded";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function formatNewsPublishedAt(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const diffMs = Date.now() - date.getTime();
+  const diffHours = Math.max(0, Math.round(diffMs / 3_600_000));
+  if (diffHours < 1) return "just now";
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.round(diffHours / 24);
+  return `${diffDays}d ago`;
 }
 
 function firstForecastNumber(...values) {
@@ -1390,7 +2650,7 @@ async function fetchStockAnalysisData(symbol, holding, options = {}) {
   const quote = await fetchStooqAnalysisQuote(normalized, holding);
   const publicData = await fetchPublicStockPages(normalized, holding).catch(() => ({}));
   const yahooFallback = Object.keys(publicData).length ? {} : await fetchYahooQuoteData(normalized, holding).catch(() => ({}));
-  const merged = { ...yahooFallback, ...quote, ...publicData };
+  const merged = { ...yahooFallback, ...publicData, ...quote };
   const rawName = publicData.name || quote.name || yahooFallback.name || getKnownCompanyName(normalized, holding) || await fetchTickerNameFromPublicPages(normalized, holding);
   const name = cleanCompanyNameCandidate(normalized, rawName);
 
@@ -1407,6 +2667,7 @@ async function fetchStockAnalysisData(symbol, holding, options = {}) {
 async function fetchStooqAnalysisQuote(symbol, holding = {}) {
   const quote = await fetchLatestQuote({ ...holding, symbol });
   if (!quote) return {};
+  applyQuote(symbol, quote);
   return {
     currency: quote.currency,
     regularMarketPrice: quote.price,
@@ -2587,7 +3848,21 @@ function renderInvestorProfile() {
   document.getElementById("profileScore").textContent = `${profile.overallScore} / 100`;
   document.getElementById("profileSummary").textContent = profile.summary;
   document.getElementById("profileInsights").innerHTML = profile.insights.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
-  document.getElementById("profileGuardrails").innerHTML = profile.factors.map((item) => `<li><strong>${escapeHtml(item.label)}: ${item.score} / 100</strong><br>${escapeHtml(item.detail)}</li>`).join("");
+  document.getElementById("profileGuardrails").innerHTML = profile.factors.map(renderProfileFactor).join("");
+}
+
+function renderProfileFactor(item) {
+  const score = clamp(Number(item.score) || 0, 0, 100);
+  return `
+    <li class="profile-factor">
+      <div class="profile-factor-heading">
+        <strong>${escapeHtml(item.label)}</strong>
+        <span>${Math.round(score)} / 100</span>
+      </div>
+      <div class="profile-factor-meter" aria-hidden="true"><span style="width:${score}%"></span></div>
+      <p>${escapeHtml(item.detail)}</p>
+    </li>
+  `;
 }
 
 function buildInvestorProfile() {
@@ -2598,6 +3873,7 @@ function buildInvestorProfile() {
   const topHolding = holdingsRows[0] || null;
   const topThreeWeight = holdingsRows.slice(0, 3).reduce((sum, row) => sum + row.weight, 0);
   const topTheme = themeRows[0] || null;
+  const topThreeThemeWeight = themeRows.slice(0, 3).reduce((sum, row) => sum + row.weight, 0);
   const trendyWeight = themeRows
     .filter((row) => ["AI", "Security", "Gaming", "Electronics", "Crypto", "Software"].includes(row.label))
     .reduce((sum, row) => sum + row.weight, 0);
@@ -2612,34 +3888,52 @@ function buildInvestorProfile() {
 
   if (totalValue <= 0) {
     return {
-      title: "Portfolio profile",
+      title: "Portfolio scorecard",
       overallScore: 0,
-      summary: "Add holdings or transactions to generate an investor profile based on concentration, sectors, asset classes, and realized activity.",
+      summary: "Add holdings or transactions to generate a portfolio rating based on balance, sector concentration, liquidity, trend exposure, news flow, and risk control.",
       insights: ["No open positions are available yet."],
       factors: [
         { label: "Balance", score: 0, detail: "No portfolio value to evaluate yet." },
-        { label: "Risk", score: 0, detail: "Risk appears only after positions are added." },
-        { label: "Trend exposure", score: 0, detail: "No sectors or themes are active yet." },
-        { label: "Diversification", score: 0, detail: "No open holdings are available yet." },
+        { label: "Sector", score: 0, detail: "No sector or theme weights are active yet." },
+        { label: "Liquidity", score: 0, detail: "Volume quality appears after market data is loaded." },
+        { label: "Trend", score: 0, detail: "Trend exposure appears after holdings are added." },
+        { label: "News", score: 0, detail: "News sentiment appears after headlines are checked." },
+        { label: "Risk control", score: 0, detail: "Risk control appears after positions are added." },
       ],
     };
   }
 
   const balanceScore = Math.round(clamp(100 - Math.max(0, (topHolding?.weight || 0) - 18) * 1.5 - Math.max(0, topThreeWeight - 45) - Math.max(0, (topTheme?.weight || 0) - 35) * 0.8, 0, 100));
   const diversificationScore = Math.round(clamp((Math.min(holdingsRows.length, 12) / 12) * 55 + (Math.min(themeRows.length, 6) / 6) * 45 - Math.max(0, topThreeWeight - 60) * 0.7, 0, 100));
+  const sectorScore = Math.round(clamp(100 - Math.max(0, (topTheme?.weight || 0) - 28) * 1.35 - Math.max(0, topThreeThemeWeight - 68) * 0.7, 0, 100));
+  const liquidity = calculatePortfolioLiquidityScore();
   const riskScore = Math.round(clamp(30 + cryptoWeight * 0.75 + volatileWeight * 0.42 + Math.max(0, (topHolding?.weight || 0) - 15) * 0.65 - etfWeight * 0.18 - defensiveWeight * 0.22, 0, 100));
   const trendScore = Math.round(clamp(trendyWeight + cryptoWeight * 0.4 + Math.max(0, volatileWeight - 20) * 0.35, 0, 100));
+  const trendDisciplineScore = Math.round(clamp(100 - Math.abs(trendScore - 42) * 1.05 - Math.max(0, trendyWeight - 55) * 0.45, 0, 100));
   const riskControlScore = Math.round(clamp(100 - (riskScore * 0.55 + Math.max(0, topThreeWeight - 45) * 0.45), 0, 100));
-  const overallScore = Math.round(clamp((balanceScore * 0.34) + (diversificationScore * 0.28) + (riskControlScore * 0.24) + ((100 - Math.abs(trendScore - 45)) * 0.14), 0, 100));
+  const newsRisk = buildPortfolioNewsRisk();
+  const newsScore = newsRisk.hasCoverage ? Math.round(clamp(100 - newsRisk.score, 0, 100)) : 55;
+  const overallScore = Math.round(clamp(
+    balanceScore * 0.22
+    + sectorScore * 0.15
+    + liquidity.score * 0.14
+    + trendDisciplineScore * 0.13
+    + newsScore * 0.15
+    + riskControlScore * 0.21,
+    0,
+    100,
+  ));
 
-  const title = getInvestorProfileTitle({ balanceScore, riskScore, trendScore, topHoldingWeight: topHolding?.weight || 0 });
-  const summary = `This portfolio is currently ${formatProfileDescriptor(balanceScore, riskScore, trendScore)}. The biggest sector/theme is ${topTheme ? `${topTheme.label} at ${formatPercent(topTheme.weight)}` : "not clear yet"}, and the top three positions make up ${formatPercent(topThreeWeight)} of open market value. That means the main question is not only what you own, but how much of the portfolio each theme is allowed to become.`;
+  const title = getPortfolioRatingTitle(overallScore);
+  const summary = `This portfolio rates ${overallScore} / 100: ${formatPortfolioRatingDescriptor(overallScore)}. The largest theme is ${topTheme ? `${topTheme.label} at ${formatPercent(topTheme.weight)}` : "not clear yet"}, the top three positions are ${formatPercent(topThreeWeight)}, and news risk is ${newsRisk.hasCoverage ? newsRisk.level.toLowerCase() : "not fully loaded yet"}.`;
   const realizedRows = getRealizedGainRows();
 
   const insights = [
-    `Sector/theme weights: ${formatWeightList(themeRows, 4)}.`,
-    `Asset class split: ${formatWeightList(assetRows, 4)}.`,
+    `Sector/theme weights: ${formatWeightList(themeRows, 4)}. Top three themes are ${formatPercent(topThreeThemeWeight)}.`,
+    `Asset class split: ${formatWeightList(assetRows, 4)}. Diversification sub-score is ${diversificationScore} / 100.`,
     topHolding ? `Largest holding is ${topHolding.symbol} at ${formatPercent(topHolding.weight)}; top 3 holdings are ${formatPercent(topThreeWeight)}.` : "No single open holding dominates yet.",
+    liquidity.coveredWeight > 0 ? `Liquidity check covered ${formatPercent(liquidity.coveredWeight)} of open value; weakest volume signal is ${liquidity.weakestLabel}.` : "Volume data is still limited; open a few stock windows to enrich liquidity scoring.",
+    newsRisk.hasCoverage ? newsRisk.summary : "News score will sharpen as ticker headlines are checked.",
     realizedRows.length ? `Realized G/L by class: ${formatSignedWeightList(realizedRows, 3)}.` : "No realized gains or losses are recorded yet.",
   ];
 
@@ -2652,45 +3946,118 @@ function buildInvestorProfile() {
         : "No single holding is overwhelming the portfolio based on the current open positions.",
     },
     {
-      label: "Risk",
-      score: riskScore,
-      detail: riskScore >= 70
-        ? "Risk reads high because volatile themes, crypto, or concentration carry a lot of the portfolio."
-        : riskScore >= 45
-          ? "Risk reads moderate: there is growth exposure, but it is not all concentrated in one risky bucket."
-          : "Risk reads relatively low because volatile themes are limited or diversified by broader holdings.",
+      label: "Sector",
+      score: sectorScore,
+      detail: topTheme
+        ? `${topTheme.label} is ${formatPercent(topTheme.weight)} of open value; top three themes are ${formatPercent(topThreeThemeWeight)}.`
+        : "Sector/theme concentration is not clear yet.",
     },
     {
-      label: "Trend exposure",
-      score: trendScore,
+      label: "Liquidity",
+      score: liquidity.score,
+      detail: liquidity.detail,
+    },
+    {
+      label: "Trend",
+      score: trendDisciplineScore,
       detail: trendScore >= 65
-        ? "A large part of the portfolio is linked to current market narratives such as AI, security, electronics, crypto, or software."
-        : "Trend exposure is present but not the whole portfolio; this gives you room to be selective instead of chasing every theme.",
+        ? "Trend exposure is high, so the portfolio may move with current narratives such as AI, software, crypto, or security."
+        : trendScore >= 35
+          ? "Trend exposure is present but not dominant, which leaves room to be selective."
+          : "Trend exposure is low; this can reduce narrative risk but may also limit growth-theme participation.",
     },
     {
-      label: "Diversification",
-      score: diversificationScore,
-      detail: `${holdingsRows.length} open holding${holdingsRows.length === 1 ? "" : "s"} across ${themeRows.length} sector/theme bucket${themeRows.length === 1 ? "" : "s"}.`,
+      label: "News",
+      score: newsScore,
+      detail: newsRisk.hasCoverage
+        ? `${newsRisk.summary} Coverage: ${newsRisk.detail}.`
+        : "News sentiment is not fully loaded yet; open stock windows or wait for the background headline check.",
+    },
+    {
+      label: "Risk control",
+      score: riskControlScore,
+      detail: riskScore >= 70
+        ? "Underlying risk reads high because volatile themes, crypto, or concentration carry a lot of the portfolio."
+        : riskScore >= 45
+          ? "Underlying risk reads moderate: there is growth exposure, but it is not all concentrated in one risky bucket."
+          : "Underlying risk reads relatively low because volatile themes are limited or diversified by broader holdings.",
     },
   ];
 
   return { title, overallScore, summary, insights, factors };
 }
 
-function getInvestorProfileTitle({ balanceScore, riskScore, trendScore, topHoldingWeight }) {
-  if (topHoldingWeight >= 35) return "Concentrated conviction profile";
-  if (riskScore >= 72 && trendScore >= 60) return "High-growth thematic profile";
-  if (trendScore >= 65) return "Trend-led growth profile";
-  if (balanceScore >= 72 && riskScore <= 55) return "Balanced growth profile";
-  if (riskScore <= 38) return "Defensive profile";
-  return "Focused growth profile";
+function getPortfolioRatingTitle(score) {
+  if (score >= 82) return "Strong portfolio rating";
+  if (score >= 68) return "Healthy portfolio rating";
+  if (score >= 52) return "Watchlist portfolio rating";
+  if (score >= 36) return "Fragile portfolio rating";
+  return "High-review portfolio rating";
 }
 
-function formatProfileDescriptor(balanceScore, riskScore, trendScore) {
-  const balance = balanceScore >= 70 ? "well balanced" : balanceScore >= 45 ? "partly balanced" : "concentrated";
-  const risk = riskScore >= 70 ? "high risk" : riskScore >= 45 ? "medium risk" : "lower risk";
-  const trend = trendScore >= 65 ? "very trend exposed" : trendScore >= 40 ? "moderately trend exposed" : "less trend driven";
-  return `${balance}, ${risk}, and ${trend}`;
+function formatPortfolioRatingDescriptor(score) {
+  if (score >= 82) return "strong control across concentration, liquidity, news, and risk";
+  if (score >= 68) return "healthy, with a few areas worth monitoring";
+  if (score >= 52) return "mixed, with several factors that deserve review";
+  if (score >= 36) return "fragile, with concentration or risk signals pulling the score down";
+  return "high review, because multiple portfolio controls are weak or missing";
+}
+
+function calculatePortfolioLiquidityScore() {
+  const totalValue = getTotalValue();
+  const rows = getVisibleHoldings()
+    .filter((holding) => holding.symbol && holding.symbol !== "CASH" && getMarketValue(holding) > 0)
+    .map((holding) => {
+      const score = getHoldingLiquidityScore(holding);
+      const weight = safePercent(getMarketValue(holding), totalValue);
+      return {
+        symbol: holding.symbol,
+        score,
+        weight,
+        hasVolume: hasHoldingVolumeData(holding),
+      };
+    });
+
+  if (!rows.length) {
+    return { score: 0, coveredWeight: 0, weakestLabel: "none", detail: "No open holdings are available for volume scoring." };
+  }
+
+  const score = Math.round(rows.reduce((sum, row) => sum + row.score * safeRatio(row.weight, 100), 0));
+  const coveredWeight = rows.filter((row) => row.hasVolume).reduce((sum, row) => sum + row.weight, 0);
+  const weakest = [...rows].sort((a, b) => a.score - b.score)[0];
+  const detail = coveredWeight > 0
+    ? `Volume/liquidity data covers ${formatPercent(coveredWeight)} of open value; ${weakest.symbol} is the weakest scored position at ${weakest.score} / 100.`
+    : "Volume data is limited, so this uses conservative placeholder scores until market details are loaded.";
+
+  return {
+    score,
+    coveredWeight,
+    weakestLabel: weakest ? `${weakest.symbol} (${weakest.score} / 100)` : "none",
+    detail,
+  };
+}
+
+function hasHoldingVolumeData(holding) {
+  const analysis = getAnalysisForHolding(holding);
+  return Number(analysis.averageDailyVolume3Month || analysis.averageDailyVolume10Day) > 0;
+}
+
+function getHoldingLiquidityScore(holding) {
+  const analysis = getAnalysisForHolding(holding);
+  const volume = Number(analysis.averageDailyVolume3Month || analysis.averageDailyVolume10Day) || 0;
+  const price = Number(analysis.regularMarketPrice ?? analysis.price ?? holding.price) || 0;
+  const currency = normalizeCurrency(analysis.currency || holding.currency || BASE_CURRENCY);
+  const marketValue = getMarketValue(holding);
+
+  if (!volume || !price || marketValue <= 0) {
+    if (/ETF|Broad ETF/i.test(`${holding.assetClass} ${getHoldingSectorTheme(holding)}`)) return 72;
+    if (/Crypto/i.test(holding.assetClass)) return 58;
+    return 55;
+  }
+
+  const dailyValueEUR = toEUR(volume * price, currency);
+  const coverageRatio = safeRatio(dailyValueEUR, marketValue);
+  return Math.round(clamp(25 + Math.log10(coverageRatio + 1) * 22, 25, 100));
 }
 
 function getThemeWeightRows() {
@@ -2751,68 +4118,62 @@ function formatWeightList(rows, maxItems) {
 function formatSignedWeightList(rows, maxItems) {
   return rows.slice(0, maxItems).map((row) => `${row.label} ${formatSignedEUR(row.value)}`).join(", ");
 }
-async function refreshMarketData({ quiet = false, forceAnalysis = false } = {}) {
+async function refreshMarketData({ quiet = false, refreshAnalysis = false } = {}) {
   state.marketRefreshing = true;
-  state.marketMessage = "Refreshing FX, prices, analysis, and key dates";
+  state.marketMessage = "Refreshing visible values";
+  state.refreshDetail = "Updating EUR/USD exchange rate...";
+  renderVisibleRefreshOverlay();
   renderMarketStatus();
 
   let quoteResult = { updated: 0, total: 0 };
-  let benchmarkResult = { updated: 0, total: benchmarkDefinitions.length };
-  let analysisResult = { updated: 0, total: uniqueTickersForQuotes().length };
+  let analysisResult = { updated: 0, total: uniqueVisibleTickersForQuotes().length };
   let fxOk = false;
 
   try {
-    await refreshFxRates();
-    fxOk = true;
-  } catch (error) {
-    state.marketMessage = quiet ? "" : `FX refresh failed: ${error.message}`;
-  }
-
-  try {
-    quoteResult = await refreshQuotes();
-  } catch (error) {
-    if (!quiet) {
-      state.marketMessage = `Price refresh failed: ${error.message}`;
+    try {
+      await refreshFxRates();
+      fxOk = true;
+    } catch (error) {
+      state.marketMessage = quiet ? "" : `FX refresh failed: ${error.message}`;
     }
-  }
 
-  try {
-    await refreshTickerNames();
-  } catch (error) {
-    if (!quiet) {
-      state.marketMessage = `Name refresh failed: ${error.message}`;
+    state.refreshDetail = "Updating open portfolio ticker prices...";
+    renderVisibleRefreshOverlay();
+
+    try {
+      quoteResult = await refreshQuotes();
+    } catch (error) {
+      if (!quiet) state.marketMessage = `Price refresh failed: ${error.message}`;
     }
-  }
 
-  try {
-    benchmarkResult = await refreshBenchmarks();
-  } catch (error) {
-    if (!quiet) {
-      state.marketMessage = `Benchmark refresh failed: ${error.message}`;
+    if (refreshAnalysis) {
+      state.refreshDetail = "Updating detailed ticker analysis on demand...";
+      renderVisibleRefreshOverlay();
+      try {
+        await refreshTickerNames();
+        analysisResult = await refreshStockAnalyses({ force: true });
+      } catch (error) {
+        if (!quiet) state.marketMessage = `Analysis refresh failed: ${error.message}`;
+      }
     }
-  }
 
-  try {
-    analysisResult = await refreshStockAnalyses({ force: forceAnalysis });
+    const fxLabel = fxOk ? "live FX" : "fallback FX";
+    const analysisLabel = refreshAnalysis ? ` | analysis ${analysisResult.updated}/${analysisResult.total}` : "";
+    state.marketMessage = `${fxLabel} | USD/EUR ${formatDecimal(state.fx.ratesToEUR.USD)} | portfolio prices ${quoteResult.updated}/${quoteResult.total}${analysisLabel}`;
+
+    saveFx();
+    saveHoldings();
+    saveTickers();
+    if (refreshAnalysis) saveStockAnalysisCache();
+    performanceData = buildPerformanceData();
   } catch (error) {
-    if (!quiet) {
-      state.marketMessage = `Analysis refresh failed: ${error.message}`;
-    }
+    state.marketMessage = quiet ? "Using locally cached portfolio data." : `Refresh failed: ${error.message}`;
+  } finally {
+    state.marketRefreshing = false;
+    state.refreshDetail = "";
+    render();
   }
-
-  state.marketRefreshing = false;
-  const fxLabel = fxOk ? "live FX" : "fallback FX";
-  state.marketMessage = `${fxLabel} | USD/EUR ${formatDecimal(state.fx.ratesToEUR.USD)} | prices ${quoteResult.updated}/${quoteResult.total} | analysis ${analysisResult.updated}/${analysisResult.total} | markets ${benchmarkResult.updated}/${benchmarkResult.total}`;
-
-  saveFx();
-  saveHoldings();
-  saveTickers();
-  saveBenchmarkSeries();
-  saveStockAnalysisCache();
-  performanceData = buildPerformanceData();
-  render();
 }
-
 async function refreshFxRates() {
   const response = await fetch("https://api.frankfurter.dev/v2/rate/USD/EUR", { cache: "no-store" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -2829,21 +4190,20 @@ async function refreshFxRates() {
 }
 
 async function refreshQuotes() {
-  const subjects = uniqueTickersForQuotes();
+  const subjects = uniqueVisibleTickersForQuotes();
+  const quotes = await fetchLatestQuotes(subjects);
   let updated = 0;
 
-  for (const ticker of subjects) {
-    const quote = await fetchLatestQuote(ticker);
-    if (!quote) continue;
-    applyQuote(ticker.symbol, quote);
+  quotes.forEach((quote, index) => {
+    if (!quote) return;
+    applyQuote(subjects[index].symbol, quote);
     updated += 1;
-  }
+  });
 
   return { updated, total: subjects.length };
 }
-
 async function refreshTickerNames() {
-  const subjects = uniqueTickersForQuotes().filter((ticker) => shouldLookupTickerName(ticker));
+  const subjects = uniqueVisibleTickersForQuotes().filter((ticker) => shouldLookupTickerName(ticker));
   let updated = 0;
 
   for (const ticker of subjects) {
@@ -2864,7 +4224,7 @@ async function refreshTickerNames() {
 }
 
 async function refreshStockAnalyses({ force = false } = {}) {
-  const subjects = uniqueTickersForQuotes().filter((ticker) => ticker.symbol && ticker.symbol !== "CASH");
+  const subjects = uniqueVisibleTickersForQuotes().filter((ticker) => ticker.symbol && ticker.symbol !== "CASH");
   let updated = 0;
 
   for (const ticker of subjects) {
@@ -2933,17 +4293,38 @@ function applyTickerName(symbol, name) {
   if (state.stockAnalysis[normalized]) state.stockAnalysis[normalized].name = cleanName;
 }
 
-async function refreshBenchmarks() {
+async function refreshBenchmarkOnDemand(id) {
+  if (!id) return;
+  state.marketRefreshing = true;
+  state.refreshDetail = "Updating selected market comparison line...";
+  renderVisibleRefreshOverlay();
+  renderMarketStatus();
+
+  try {
+    const result = await refreshBenchmarks([id]);
+    saveBenchmarkSeries();
+    state.marketMessage = `Updated market comparison ${result.updated}/${result.total}`;
+  } catch (error) {
+    state.marketMessage = `Benchmark refresh failed: ${error.message}`;
+  } finally {
+    state.marketRefreshing = false;
+    state.refreshDetail = "";
+    render();
+  }
+}
+async function refreshBenchmarks(ids = state.activeBenchmarks) {
+  const activeIds = new Set((ids?.length ? ids : state.activeBenchmarks).filter(Boolean));
+  const benchmarks = benchmarkDefinitions.filter((benchmark) => activeIds.has(benchmark.id));
   let updated = 0;
 
-  for (const benchmark of benchmarkDefinitions) {
+  for (const benchmark of benchmarks) {
     const series = await fetchBenchmarkHistory(benchmark);
     if (!series.length) continue;
     state.benchmarkSeries[benchmark.id] = series;
     updated += 1;
   }
 
-  return { updated, total: benchmarkDefinitions.length };
+  return { updated, total: benchmarks.length };
 }
 
 async function fetchBenchmarkHistory(benchmark) {
@@ -2987,40 +4368,86 @@ async function fetchGoogleFinanceQuote(ticker) {
   return null;
 }
 async function fetchLatestQuote(ticker) {
+  const [serverQuote] = await fetchLatestQuotes([ticker]).catch(() => [null]);
+  if (serverQuote) return serverQuote;
+
   const googleQuote = await fetchGoogleFinanceQuote(ticker).catch(() => null);
   if (googleQuote) return googleQuote;
 
-  const candidates = buildQuoteCandidates(ticker);
-  const today = formatDateForQuote(new Date());
-  const start = new Date();
-  start.setDate(start.getDate() - 21);
-  const d1 = formatDateForQuote(start);
-
-  for (const candidate of candidates) {
-    try {
-      const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(candidate.symbol)}&d1=${d1}&d2=${today}&i=d`;
-      const response = await fetch(url, { cache: "no-store" });
-      if (!response.ok) continue;
-      const text = await response.text();
-      const rows = parseCsv(text).filter((row) => row.length >= 5 && row[0] && row[4] && row[4] !== "Close");
-      if (!rows.length) continue;
-      const latest = rows[rows.length - 1];
-      const previous = rows.length > 1 ? rows[rows.length - 2] : null;
-      const price = parseNumber(latest[4]);
-      if (!Number.isFinite(price) || price <= 0) continue;
-      const previousPrice = previous ? parseNumber(previous[4]) : NaN;
-      return {
-        price,
-        currency: candidate.currency,
-        dayChangePct: Number.isFinite(previousPrice) && previousPrice > 0 ? safePercent(price - previousPrice, previousPrice) : 0,
-        sourceSymbol: candidate.symbol,
-      };
-    } catch {
-      continue;
-    }
-  }
-
   return null;
+}
+
+async function fetchLatestQuotes(tickers) {
+  const subjects = (Array.isArray(tickers) ? tickers : [])
+    .filter((ticker) => normalizeSymbol(ticker?.symbol) && normalizeSymbol(ticker?.symbol) !== "CASH");
+  if (!subjects.length) return [];
+
+  const response = await fetch(getQuotesEndpoint(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify({
+      items: subjects.map(buildQuoteRequestItem),
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Quote server returned HTTP ${response.status}`);
+
+  const quoteMap = new Map(
+    (Array.isArray(data.items) ? data.items : [])
+      .map((item) => [normalizeSymbol(item.symbol), normalizeLatestQuote(item)])
+      .filter(([, quote]) => quote),
+  );
+
+  return subjects.map((ticker) => quoteMap.get(normalizeSymbol(ticker.symbol)) || null);
+}
+
+function buildQuoteRequestItem(ticker) {
+  return {
+    symbol: normalizeSymbol(ticker.symbol),
+    currency: normalizeCurrency(ticker.currency || inferCurrencyForSymbol(ticker.symbol, "", ticker.assetClass)),
+    assetClass: ticker.assetClass || inferAssetClassFromSymbol(ticker.symbol),
+    candidates: buildQuoteCandidates(ticker),
+  };
+}
+
+function normalizeLatestQuote(item) {
+  const price = Number(item?.price);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return {
+    price,
+    currency: normalizeCurrency(item.currency || BASE_CURRENCY),
+    dayChangePct: Number(item.dayChangePct) || 0,
+    sourceSymbol: item.sourceSymbol || "",
+    source: item.source || "Local quote API",
+    marketTime: item.marketTime || "",
+    fetchedAt: item.fetchedAt || "",
+  };
+}
+
+function getQuotesEndpoint() {
+  const path = "/api/quotes";
+  if (/^https?:$/i.test(window.location.protocol)) return path;
+  return `http://localhost:8787${path}`;
+}
+
+async function refreshQuoteForSymbol(symbol, holding = getHoldingForAnalysis(symbol)) {
+  const normalized = normalizeSymbol(symbol);
+  if (!normalized || normalized === "CASH") return null;
+  const quote = await fetchLatestQuote({ ...holding, symbol: normalized });
+  if (!quote) return null;
+
+  applyQuote(normalized, quote);
+  saveHoldings();
+  saveTickers();
+  saveStockAnalysisCache();
+
+  if (state.selectedStockSymbol === normalized) {
+    renderStockAnalysisModal(normalized, getHoldingForAnalysis(normalized), state.stockAnalysis[normalized] || null, false);
+  }
+  renderHoldings();
+  renderSummary();
+  return quote;
 }
 
 function buildQuoteCandidates(ticker) {
@@ -3039,10 +4466,12 @@ function buildQuoteCandidates(ticker) {
     }
   }
 
-  if (ticker.assetClass === "Crypto") {
+  if (isCryptoTicker(ticker)) {
     const cryptoSymbol = raw.replace(/[^a-z0-9]/g, "");
-    candidates.push({ symbol: `${cryptoSymbol}eur`, currency: "EUR" });
-    candidates.push({ symbol: `${cryptoSymbol}usd`, currency: "USD" });
+    const preferredCurrency = normalizeCurrency(ticker.currency || inferCurrencyForSymbol(ticker.symbol, "", ticker.assetClass));
+    const otherCurrency = preferredCurrency === "USD" ? "EUR" : "USD";
+    candidates.push({ symbol: `${cryptoSymbol}${preferredCurrency.toLowerCase()}`, currency: preferredCurrency });
+    candidates.push({ symbol: `${cryptoSymbol}${otherCurrency.toLowerCase()}`, currency: otherCurrency });
   }
 
   if (raw.includes(".")) {
@@ -3063,6 +4492,12 @@ function buildQuoteCandidates(ticker) {
   return uniqueBy(candidates, (candidate) => `${candidate.symbol}-${candidate.currency}`);
 }
 
+function isCryptoTicker(ticker) {
+  const assetClass = String(ticker?.assetClass || "").toLowerCase();
+  const symbol = normalizeSymbol(ticker?.symbol);
+  return assetClass.includes("crypto") || /^(BTC|ETH|SOL|DOGE|XRP|ADA|BNB|AVAX|DOT|LINK|LTC|BCH)$/.test(symbol);
+}
+
 function applyQuote(symbol, quote) {
   const normalized = normalizeSymbol(symbol);
   holdings.forEach((holding) => {
@@ -3070,6 +4505,9 @@ function applyQuote(symbol, quote) {
     holding.price = quote.price;
     holding.currency = quote.currency;
     holding.dayChangePct = quote.dayChangePct;
+    holding.quoteSource = quote.source || "";
+    holding.quoteSourceSymbol = quote.sourceSymbol || "";
+    holding.quoteFetchedAt = quote.fetchedAt || new Date().toISOString();
   });
 
   trackedTickers.forEach((ticker) => {
@@ -3077,7 +4515,24 @@ function applyQuote(symbol, quote) {
     ticker.price = quote.price;
     ticker.currency = quote.currency;
     ticker.dayChangePct = quote.dayChangePct;
+    ticker.quoteSource = quote.source || "";
+    ticker.quoteSourceSymbol = quote.sourceSymbol || "";
+    ticker.quoteFetchedAt = quote.fetchedAt || new Date().toISOString();
   });
+
+  if (state.stockAnalysis[normalized]) {
+    state.stockAnalysis[normalized] = {
+      ...state.stockAnalysis[normalized],
+      currency: quote.currency,
+      regularMarketPrice: quote.price,
+      price: quote.price,
+      regularMarketChangePercent: quote.dayChangePct,
+      dayChangePct: quote.dayChangePct,
+      sourceSymbol: quote.sourceSymbol || state.stockAnalysis[normalized].sourceSymbol || "",
+      source: formatDataSources([quote.source, state.stockAnalysis[normalized].source]),
+      quoteFetchedAt: quote.fetchedAt || new Date().toISOString(),
+    };
+  }
 }
 
 async function importCsvFile() {
@@ -3551,7 +5006,7 @@ function openModal(id) {
     updateTransactionMode();
     updateTransactionPreview();
   }
-  const firstField = document.querySelector(`#${id} select, #${id} input`);
+  const firstField = id === "stockModal" ? null : document.querySelector(`#${id} select, #${id} input`);
   if (firstField) firstField.focus();
 }
 
@@ -4293,6 +5748,20 @@ function loadStockAnalysisCache() {
   }
 }
 
+function loadNewsSentimentCache() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKeys.newsSentiment) || "{}");
+    if (!saved || typeof saved !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(saved)
+        .map(([symbol, item]) => [normalizeSymbol(symbol), normalizeNewsSentimentItem({ ...item, symbol: item?.symbol || symbol }, item?.generatedAt)])
+        .filter(([symbol]) => symbol),
+    );
+  } catch {
+    return {};
+  }
+}
+
 function loadManualYahooLinks() {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKeys.manualYahooLinks) || "{}");
@@ -4302,6 +5771,30 @@ function loadManualYahooLinks() {
   }
 }
 
+function loadWatchlists() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKeys.watchlists) || "[]");
+    return Array.isArray(saved) ? saved.map(normalizeStoredWatchlist).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeStoredWatchlist(watchlist) {
+  const normalized = normalizeWatchlistAction({
+    type: "watchlist",
+    title: watchlist?.title,
+    theme: watchlist?.theme,
+    items: watchlist?.items,
+  });
+  if (!normalized) return null;
+  return {
+    ...normalized,
+    id: watchlist.id || randomId(),
+    createdAt: watchlist.createdAt || new Date().toISOString(),
+    updatedAt: watchlist.updatedAt || watchlist.createdAt || new Date().toISOString(),
+  };
+}
 function saveHoldings() {
   localStorage.setItem(storageKeys.holdings, JSON.stringify(holdings));
 }
@@ -4330,8 +5823,16 @@ function saveStockAnalysisCache() {
   localStorage.setItem(storageKeys.stockAnalysis, JSON.stringify(state.stockAnalysis));
 }
 
+function saveNewsSentimentCache() {
+  localStorage.setItem(storageKeys.newsSentiment, JSON.stringify(state.newsSentiment));
+}
+
 function saveManualYahooLinks() {
   localStorage.setItem(storageKeys.manualYahooLinks, JSON.stringify(state.manualYahooLinks));
+}
+
+function saveWatchlists() {
+  localStorage.setItem(storageKeys.watchlists, JSON.stringify(state.watchlists));
 }
 
 function hasSavedHoldings() {
@@ -4426,6 +5927,15 @@ function mergeTickers(existing, incoming) {
 
 function uniqueTickersForQuotes() {
   return uniqueBy(trackedTickers.filter((ticker) => ticker.symbol && ticker.symbol !== "CASH"), (ticker) => ticker.symbol);
+}
+function uniqueVisibleTickersForQuotes() {
+  const openSymbols = new Set(getVisibleHoldings().map((holding) => holding.symbol).filter((symbol) => symbol && symbol !== "CASH"));
+  const visibleTickers = getVisibleHoldings().map((holding) => {
+    const tracked = trackedTickers.find((ticker) => ticker.symbol === holding.symbol) || {};
+    return { ...tracked, ...holding };
+  });
+  const trackedOpen = trackedTickers.filter((ticker) => openSymbols.has(ticker.symbol));
+  return uniqueBy([...visibleTickers, ...trackedOpen].filter((ticker) => ticker.symbol && ticker.symbol !== "CASH"), (ticker) => ticker.symbol);
 }
 
 function getVisibleHoldings() {
