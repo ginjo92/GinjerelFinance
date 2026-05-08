@@ -56,14 +56,6 @@ const benchmarkDefinitions = [
   { id: "bonds", name: "Core bonds", symbol: "BND", sourceSymbol: "bnd.us", currency: "USD", color: "#64748b" },
 ];
 
-const benchmarkFallbackReturns = {
-  sp500: [0.9, -0.5, 1.9, 1.4, -1.1, 2.7, 0.5, -1.8, 2.4, 1.2, 0.6, 2.1, -0.9, 1.6, 2.0, -0.3, 0.9, 2.6, -1.5, 1.9, 0.4, 1.5, 2.4, -0.5, 1.1, 1.8, -1.9, 2.9, 1.0, -0.7, 2.1, 1.1, 0.3, 2.0, -0.9, 2.2, 0.7, 1.3, -0.4, 1.8],
-  nasdaq: [1.4, -1.1, 2.5, 2.2, -1.7, 3.7, 0.8, -2.8, 3.2, 1.8, 0.9, 3.0, -1.5, 2.3, 2.8, -0.7, 1.4, 3.5, -2.4, 2.7, 0.7, 2.1, 3.4, -0.9, 1.6, 2.7, -2.9, 4.1, 1.5, -1.2, 3.2, 1.8, 0.5, 2.8, -1.4, 3.1, 1.1, 1.9, -0.8, 2.6],
-  world: [0.8, -0.4, 1.5, 1.2, -0.8, 2.1, 0.4, -1.3, 1.9, 1.0, 0.4, 1.8, -0.7, 1.3, 1.6, -0.2, 0.7, 2.0, -1.2, 1.5, 0.4, 1.2, 1.9, -0.4, 0.9, 1.5, -1.5, 2.3, 0.8, -0.5, 1.7, 0.9, 0.2, 1.6, -0.7, 1.8, 0.6, 1.0, -0.3, 1.5],
-  europe: [0.6, -0.3, 1.3, 1.0, -0.7, 1.8, 0.3, -1.1, 1.5, 0.8, 0.3, 1.4, -0.6, 1.1, 1.3, -0.2, 0.6, 1.7, -1.0, 1.2, 0.3, 1.0, 1.5, -0.3, 0.8, 1.3, -1.3, 1.9, 0.7, -0.4, 1.5, 0.8, 0.2, 1.3, -0.6, 1.6, 0.5, 0.9, -0.3, 1.2],
-  bonds: [0.2, 0.1, -0.3, 0.4, 0.2, -0.2, 0.3, 0.1, -0.1, 0.2, 0.3, 0.1, -0.4, 0.3, 0.2, 0.2, -0.1, 0.3, 0.1, -0.2, 0.2, 0.3, -0.1, 0.2, 0.1, 0.3, -0.3, 0.4, 0.2, 0.1, -0.2, 0.3, 0.1, 0.2, -0.1, 0.3, 0.1, 0.2, 0.0, 0.2],
-};
-
 const defaultFx = {
   ratesToEUR: { EUR: 1, USD: 0.92 },
   eurToUsd: 1.087,
@@ -232,6 +224,9 @@ const state = {
   newsSentiment: loadNewsSentimentCache(),
   manualYahooLinks: loadManualYahooLinks(),
   watchlists: loadWatchlists(),
+  performancePriceSeries: {},
+  performanceHistoryLoading: false,
+  performanceHistoryMessage: "",
   stockChartSeries: {},
   stockChartPeriod: "6M",
   stockChartHoverX: null,
@@ -2078,18 +2073,10 @@ async function loadStockChartSeriesForSymbol(symbol, holding = {}) {
 
 async function fetchStockHistorySeries(symbol, holding = {}) {
   const candidates = buildQuoteCandidates({ ...holding, symbol });
-  const response = await fetch(getStockHistoryEndpoint(candidates), { cache: "no-store" });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Stock history server returned HTTP ${response.status}`);
+  const data = await fetchHistoricalPriceSeries(candidates, 760);
 
   const points = (Array.isArray(data.points) ? data.points : [])
-    .map((point) => {
-      const time = Date.parse(point.date);
-      return {
-        date: Number.isFinite(time) ? new Date(time).toISOString() : "",
-        value: Number(point.value),
-      };
-    })
+    .map(normalizeHistoricalPricePoint)
     .filter((point) => point.date && Number.isFinite(point.value) && point.value > 0);
 
   if (points.length < 2) throw new Error("No historical prices found.");
@@ -2097,17 +2084,32 @@ async function fetchStockHistorySeries(symbol, holding = {}) {
     points,
     currency: normalizeCurrency(data.currency || holding.currency || BASE_CURRENCY),
     sourceSymbol: data.sourceSymbol || "",
-    source: data.source || "Stooq",
+    source: data.source || "Yahoo Finance",
   };
 }
 
-function getStockHistoryEndpoint(candidates) {
+async function fetchHistoricalPriceSeries(candidates, days = 760) {
+  const response = await fetch(getStockHistoryEndpoint(candidates, days), { cache: "no-store" });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Stock history server returned HTTP ${response.status}`);
+  return data;
+}
+
+function normalizeHistoricalPricePoint(point) {
+  const time = Date.parse(point?.date);
+  return {
+    date: Number.isFinite(time) ? new Date(time).toISOString() : "",
+    value: Number(point?.value),
+  };
+}
+
+function getStockHistoryEndpoint(candidates, days = 760) {
   const params = new URLSearchParams({
     candidates: candidates
       .slice(0, 12)
       .map((candidate) => `${candidate.symbol}:${candidate.currency}`)
       .join(","),
-    days: "760",
+    days: String(clamp(Number(days) || 760, 30, 1825)),
   });
   const path = `/api/stock-history?${params.toString()}`;
   if (/^https?:$/i.test(window.location.protocol)) return path;
@@ -3814,11 +3816,12 @@ function renderPerformanceChart() {
   ctx.fillRect(0, 0, width, height);
 
   drawReturnGrid(ctx, width, height, padding, min, max);
+  const dateDomain = getLineDateDomain(lines);
   lines.forEach((line) => {
-    drawIndexedLine(ctx, line.points, line.color, width, height, padding, min, max, line.label === "Portfolio" ? 5 : 2.5);
+    drawIndexedLine(ctx, line.points, line.color, width, height, padding, min, max, dateDomain, line.label === "Portfolio" ? 5 : 2.5);
   });
-  drawAxisLabels(ctx, lines[0].points, width, height, padding);
-  drawPerformanceHover(ctx, lines, width, height, padding, min, max);
+  drawAxisLabels(ctx, dateDomain, width, height, padding);
+  drawPerformanceHover(ctx, lines, width, height, padding, min, max, dateDomain);
   renderChartLegend(lines);
 }
 
@@ -4411,6 +4414,7 @@ async function refreshMarketData({ quiet = false, refreshAnalysis = false } = {}
 
   let quoteResult = { updated: 0, total: 0 };
   let analysisResult = { updated: 0, total: uniqueVisibleTickersForQuotes().length };
+  let benchmarkResult = { updated: 0, total: state.activeBenchmarks.length };
   let fxOk = false;
 
   try {
@@ -4430,6 +4434,23 @@ async function refreshMarketData({ quiet = false, refreshAnalysis = false } = {}
       if (!quiet) state.marketMessage = `Price refresh failed: ${error.message}`;
     }
 
+    state.refreshDetail = "Updating historical portfolio performance...";
+    renderVisibleRefreshOverlay();
+    try {
+      await refreshPortfolioPerformanceHistory();
+    } catch (error) {
+      if (!quiet) state.marketMessage = `Portfolio history failed: ${error.message}`;
+    }
+
+    state.refreshDetail = "Updating market comparison history...";
+    renderVisibleRefreshOverlay();
+    try {
+      benchmarkResult = await refreshBenchmarks();
+      if (benchmarkResult.updated) saveBenchmarkSeries();
+    } catch (error) {
+      if (!quiet) state.marketMessage = `Market comparison failed: ${error.message}`;
+    }
+
     if (refreshAnalysis) {
       state.refreshDetail = "Updating detailed ticker analysis on demand...";
       renderVisibleRefreshOverlay();
@@ -4443,7 +4464,7 @@ async function refreshMarketData({ quiet = false, refreshAnalysis = false } = {}
 
     const fxLabel = fxOk ? "live FX" : "fallback FX";
     const analysisLabel = refreshAnalysis ? ` | analysis ${analysisResult.updated}/${analysisResult.total}` : "";
-    state.marketMessage = `${fxLabel} | USD/EUR ${formatDecimal(state.fx.ratesToEUR.USD)} | portfolio prices ${quoteResult.updated}/${quoteResult.total}${analysisLabel}`;
+    state.marketMessage = `${fxLabel} | USD/EUR ${formatDecimal(state.fx.ratesToEUR.USD)} | portfolio prices ${quoteResult.updated}/${quoteResult.total} | history ${state.performanceHistoryMessage || "ready"} | markets ${benchmarkResult.updated}/${benchmarkResult.total}${analysisLabel}`;
 
     saveFx();
     saveHoldings();
@@ -4486,6 +4507,95 @@ async function refreshQuotes() {
 
   return { updated, total: subjects.length };
 }
+
+async function refreshPortfolioPerformanceHistory({ force = false } = {}) {
+  const subjects = getPerformanceHistorySubjects();
+  if (!subjects.length) {
+    performanceData = buildPerformanceData();
+    state.performanceHistoryMessage = "no transactions";
+    renderPerformanceChart();
+    return { updated: 0, total: 0 };
+  }
+
+  state.performanceHistoryLoading = true;
+  const days = getPerformanceHistoryDays();
+  let updated = 0;
+
+  try {
+    const results = await Promise.allSettled(
+      subjects.map(async (subject) => {
+        const cached = state.performancePriceSeries[subject.symbol];
+        if (!force && cached?.points?.length && Number(cached.days || 0) >= days && Date.now() - Number(cached.fetchedAt || 0) < 6 * 60 * 60 * 1000) {
+          return false;
+        }
+
+        const data = await fetchHistoricalPriceSeries(buildQuoteCandidates(subject), days);
+        const points = (Array.isArray(data.points) ? data.points : [])
+          .map(normalizeHistoricalPricePoint)
+          .filter((point) => point.date && Number.isFinite(point.value) && point.value > 0);
+        if (points.length < 2) throw new Error(`No history for ${subject.symbol}`);
+
+        state.performancePriceSeries[subject.symbol] = {
+          points,
+          currency: normalizeCurrency(data.currency || subject.currency || BASE_CURRENCY),
+          source: data.source || "Yahoo Finance",
+          sourceSymbol: data.sourceSymbol || "",
+          days,
+          fetchedAt: Date.now(),
+        };
+        return true;
+      }),
+    );
+
+    updated = results.filter((result) => result.status === "fulfilled" && result.value).length;
+    performanceData = buildPerformanceData();
+    state.performanceHistoryMessage = `${subjects.length - results.filter((result) => result.status === "rejected").length}/${subjects.length} tickers`;
+    renderPerformanceChart();
+    return { updated, total: subjects.length };
+  } finally {
+    state.performanceHistoryLoading = false;
+  }
+}
+
+function getPerformanceHistorySubjects() {
+  const subjectMap = new Map();
+
+  state.transactions.forEach((transaction) => {
+    const symbol = normalizeSymbol(transaction.symbol);
+    if (!symbol || symbol === "CASH" || !["buy", "sell", "dividend"].includes(transaction.type)) return;
+    const existing = subjectMap.get(symbol) || {};
+    subjectMap.set(symbol, {
+      ...existing,
+      symbol,
+      name: transaction.name || existing.name || symbol,
+      assetClass: transaction.assetClass || existing.assetClass || inferAssetClassFromSymbol(symbol),
+      currency: transaction.currency || existing.currency || inferCurrencyForSymbol(symbol, "", transaction.assetClass),
+    });
+  });
+
+  getVisibleHoldings().forEach((holding) => {
+    const symbol = normalizeSymbol(holding.symbol);
+    if (!symbol || symbol === "CASH") return;
+    subjectMap.set(symbol, {
+      ...(subjectMap.get(symbol) || {}),
+      ...holding,
+      symbol,
+    });
+  });
+
+  return [...subjectMap.values()];
+}
+
+function getPerformanceHistoryDays() {
+  const times = state.transactions
+    .map((transaction) => Date.parse(transaction.sortDate || parseTradeDate(transaction.date)?.iso || ""))
+    .filter(Number.isFinite);
+  if (!times.length) return 760;
+  const first = Math.min(...times);
+  const days = Math.ceil((Date.now() - first) / (24 * 60 * 60 * 1000)) + 14;
+  return clamp(days, 45, 1825);
+}
+
 async function refreshTickerNames() {
   const subjects = uniqueVisibleTickersForQuotes().filter((ticker) => shouldLookupTickerName(ticker));
   let updated = 0;
@@ -4600,33 +4710,31 @@ async function refreshBenchmarks(ids = state.activeBenchmarks) {
   const activeIds = new Set((ids?.length ? ids : state.activeBenchmarks).filter(Boolean));
   const benchmarks = benchmarkDefinitions.filter((benchmark) => activeIds.has(benchmark.id));
   let updated = 0;
+  let available = 0;
 
   for (const benchmark of benchmarks) {
+    if (state.benchmarkSeries[benchmark.id]?.length > 1) {
+      available += 1;
+      continue;
+    }
     const series = await fetchBenchmarkHistory(benchmark);
     if (!series.length) continue;
     state.benchmarkSeries[benchmark.id] = series;
+    available += 1;
     updated += 1;
   }
 
-  return { updated, total: benchmarks.length };
+  return { updated: available, total: benchmarks.length };
 }
 
 async function fetchBenchmarkHistory(benchmark) {
-  const today = formatDateForQuote(new Date());
-  const start = new Date();
-  start.setFullYear(start.getFullYear() - 4);
-  const d1 = formatDateForQuote(start);
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(benchmark.sourceSymbol)}&d1=${d1}&d2=${today}&i=d`;
-  const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const text = await response.text();
-  return parseCsv(text)
-    .filter((row) => row.length >= 5 && row[0] && row[4] && row[4] !== "Close")
-    .map((row) => ({
-      date: new Date(row[0]).toISOString(),
-      value: parseNumber(row[4]),
-    }))
-    .filter((point) => Number.isFinite(point.value) && point.value > 0);
+  const data = await fetchHistoricalPriceSeries(
+    [{ symbol: benchmark.sourceSymbol, currency: benchmark.currency }],
+    getPerformanceHistoryDays(),
+  );
+  return (Array.isArray(data.points) ? data.points : [])
+    .map(normalizeHistoricalPricePoint)
+    .filter((point) => point.date && Number.isFinite(point.value) && point.value > 0);
 }
 
 async function fetchGoogleFinanceQuote(ticker) {
@@ -5656,6 +5764,10 @@ function rebuildAfterDataChange() {
   ensureTickersForHoldings();
   performanceData = buildPerformanceData();
   render();
+  refreshPortfolioPerformanceHistory({ force: true }).catch((error) => {
+    state.performanceHistoryMessage = error.message || "history unavailable";
+    renderPerformanceChart();
+  });
 }
 
 function rebuildSavedPortfolioFromTransactions() {
@@ -5731,15 +5843,14 @@ function drawReturnGrid(ctx, width, height, padding, min, max) {
   }
 }
 
-function drawIndexedLine(ctx, points, color, width, height, padding, min, max, lineWidth = 3) {
+function drawIndexedLine(ctx, points, color, width, height, padding, min, max, dateDomain, lineWidth = 3) {
   if (!points.length) return;
 
-  const xRange = width - padding.left - padding.right;
   const yRange = height - padding.top - padding.bottom;
 
   ctx.beginPath();
   points.forEach((point, index) => {
-    const x = padding.left + (index / Math.max(points.length - 1, 1)) * xRange;
+    const x = getDatePosition(point.date, dateDomain, width, padding);
     const y = padding.top + (1 - (point.value - min) / (max - min)) * yRange;
     if (index === 0) {
       ctx.moveTo(x, y);
@@ -5754,7 +5865,7 @@ function drawIndexedLine(ctx, points, color, width, height, padding, min, max, l
   ctx.stroke();
 
   const last = points[points.length - 1];
-  const lastX = width - padding.right;
+  const lastX = getDatePosition(last.date, dateDomain, width, padding);
   const lastY = padding.top + (1 - (last.value - min) / (max - min)) * yRange;
   ctx.beginPath();
   ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
@@ -5762,7 +5873,7 @@ function drawIndexedLine(ctx, points, color, width, height, padding, min, max, l
   ctx.fill();
 }
 
-function drawPerformanceHover(ctx, lines, width, height, padding, min, max) {
+function drawPerformanceHover(ctx, lines, width, height, padding, min, max, dateDomain) {
   if (!Number.isFinite(state.performanceHoverX) || !lines.length || !lines[0].points.length) return;
 
   const portfolio = lines[0];
@@ -5770,9 +5881,9 @@ function drawPerformanceHover(ctx, lines, width, height, padding, min, max) {
   const xRange = width - padding.left - padding.right;
   const yRange = height - padding.top - padding.bottom;
   const x = clamp(state.performanceHoverX, padding.left, width - padding.right);
-  const index = clamp(Math.round(((x - padding.left) / Math.max(xRange, 1)) * (points.length - 1)), 0, points.length - 1);
-  const point = points[index];
-  const pointX = padding.left + (index / Math.max(points.length - 1, 1)) * xRange;
+  const targetTime = dateDomain.min + ((x - padding.left) / Math.max(xRange, 1)) * (dateDomain.max - dateDomain.min);
+  const point = getNearestPointByTime(points, targetTime);
+  const pointX = getDatePosition(point.date, dateDomain, width, padding);
   const pointY = padding.top + (1 - (point.value - min) / (max - min)) * yRange;
   const returnValue = point.value - 100;
   const valueLabel = formatSignedPercent(returnValue);
@@ -5819,6 +5930,39 @@ function drawPerformanceHover(ctx, lines, width, height, padding, min, max) {
   ctx.font = "700 11px Inter, system-ui, sans-serif";
   ctx.fillText(dateLabel, boxX + 11, boxY + 28);
   ctx.restore();
+}
+
+function getLineDateDomain(lines) {
+  const timestamps = lines
+    .flatMap((line) => line.points.map((point) => getPointTime(point.date)))
+    .filter(Number.isFinite);
+  if (!timestamps.length) {
+    const now = Date.now();
+    return { min: now - 24 * 60 * 60 * 1000, max: now };
+  }
+
+  const min = Math.min(...timestamps);
+  const max = Math.max(...timestamps);
+  return min === max ? { min: min - 12 * 60 * 60 * 1000, max: max + 12 * 60 * 60 * 1000 } : { min, max };
+}
+
+function getDatePosition(date, domain, width, padding) {
+  const time = getPointTime(date);
+  const xRange = width - padding.left - padding.right;
+  const progress = Number.isFinite(time) ? (time - domain.min) / Math.max(domain.max - domain.min, 1) : 0;
+  return padding.left + clamp(progress, 0, 1) * xRange;
+}
+
+function getPointTime(date) {
+  return date instanceof Date ? date.getTime() : Date.parse(date);
+}
+
+function getNearestPointByTime(points, targetTime) {
+  return points.reduce((nearest, point) => {
+    const pointDelta = Math.abs(getPointTime(point.date) - targetTime);
+    const nearestDelta = Math.abs(getPointTime(nearest.date) - targetTime);
+    return pointDelta < nearestDelta ? point : nearest;
+  }, points[0]);
 }
 
 function roundRect(ctx, x, y, width, height, radius) {
@@ -5883,28 +6027,25 @@ function drawLine(ctx, data, key, color, width, height, padding, min, max) {
   ctx.fill();
 }
 
-function drawAxisLabels(ctx, data, width, height, padding) {
+function drawAxisLabels(ctx, dateDomain, width, height, padding) {
   ctx.fillStyle = "#65706e";
   ctx.font = "12px Inter, system-ui, sans-serif";
-  const first = data[0].date;
-  const last = data[data.length - 1].date;
+  const first = new Date(dateDomain.min);
+  const last = new Date(dateDomain.max);
   ctx.fillText(formatMonth(first), padding.left, height - 10);
   const lastLabel = formatMonth(last);
   ctx.fillText(lastLabel, width - padding.right - ctx.measureText(lastLabel).width, height - 10);
 }
 
 function filterPerformanceData() {
-  const periods = {
-    "6M": 7,
-    "1Y": 13,
-    "3Y": 37,
-    ALL: performanceData.length,
-  };
-  return performanceData.slice(-periods[state.activePeriod]);
+  if (state.activePeriod === "ALL") return performanceData;
+  const startDate = getPeriodStartDate();
+  const filtered = performanceData.filter((point) => new Date(point.date) >= startDate);
+  return filtered.length > 1 ? filtered : performanceData.slice(-2);
 }
 
 function filterBenchmarkSeries(id) {
-  const source = state.benchmarkSeries[id]?.length ? state.benchmarkSeries[id] : buildBenchmarkFallbackSeries(id);
+  const source = state.benchmarkSeries[id]?.length ? state.benchmarkSeries[id] : [];
   const startDate = getPeriodStartDate();
   const filtered = state.activePeriod === "ALL"
     ? source
@@ -5933,41 +6074,116 @@ function getPeriodStartDate() {
   return start;
 }
 
-function buildBenchmarkFallbackSeries(id) {
-  const returns = benchmarkFallbackReturns[id] || benchmarkFallbackReturns.sp500;
-  let value = 100;
-  const start = new Date(2023, 0, 1);
+function buildPerformanceData() {
+  const transactions = state.transactions
+    .map(normalizeStoredTransaction)
+    .filter((transaction) => parseTradeDate(transaction.sortDate || transaction.date))
+    .sort(compareTransactionsAsc);
 
-  return returns.map((returnValue, index) => {
-    value *= 1 + returnValue / 100;
-    const date = new Date(start);
-    date.setMonth(start.getMonth() + index);
-    return { date: date.toISOString(), value };
-  });
+  if (!transactions.length) return buildFlatPerformanceData();
+
+  const firstDate = parseTradeDate(transactions[0].sortDate || transactions[0].date)?.iso;
+  if (!firstDate) return buildFlatPerformanceData();
+
+  const start = new Date(`${firstDate}T00:00:00`);
+  const maxLookbackStart = new Date();
+  maxLookbackStart.setDate(maxLookbackStart.getDate() - 1825);
+  const cursor = start < maxLookbackStart ? maxLookbackStart : start;
+  const today = new Date();
+  const quantities = {};
+  const output = [];
+  let transactionIndex = 0;
+  let previousValue = 0;
+  let portfolioIndex = 100;
+
+  while (cursor <= today) {
+    const dateKey = toIsoDate(cursor);
+    const dayTransactions = [];
+    while (transactionIndex < transactions.length && getTransactionDateKey(transactions[transactionIndex]) <= dateKey) {
+      dayTransactions.push(transactions[transactionIndex]);
+      transactionIndex += 1;
+    }
+
+    let externalFlow = 0;
+    let distribution = 0;
+    dayTransactions.forEach((transaction) => {
+      const symbol = normalizeSymbol(transaction.symbol);
+      const currency = normalizeCurrency(transaction.currency || BASE_CURRENCY);
+      const quantity = Number(transaction.quantity) || 0;
+      const price = Number(transaction.price) || 0;
+      const fees = Number(transaction.fees) || 0;
+      const amount = getTransactionAmount(transaction.type, quantity, price);
+
+      if (transaction.type === "buy" && symbol && symbol !== "CASH") {
+        quantities[symbol] = (quantities[symbol] || 0) + quantity;
+        externalFlow += toEUR(amount + fees, currency);
+      } else if (transaction.type === "sell" && symbol && symbol !== "CASH") {
+        quantities[symbol] = (quantities[symbol] || 0) - quantity;
+        externalFlow -= toEUR(Math.max(amount - fees, 0), currency);
+      } else if (transaction.type === "dividend") {
+        distribution += toEUR(Math.max(amount - fees, 0), currency);
+      } else if (transaction.type === "fee") {
+        distribution -= toEUR(amount + fees, currency);
+      }
+    });
+
+    const marketValue = Object.entries(quantities).reduce((sum, [symbol, quantity]) => {
+      if (Math.abs(quantity) < 0.0000001) return sum;
+      const price = getHistoricalPriceForSymbol(symbol, dateKey);
+      const currency = normalizeCurrency(state.performancePriceSeries[symbol]?.currency || getHoldingForAnalysis(symbol).currency || BASE_CURRENCY);
+      return sum + toEUR(quantity * price, currency);
+    }, 0);
+
+    const denominator = previousValue + Math.max(externalFlow, 0);
+    if (previousValue > 0 || denominator > 0) {
+      const dailyReturn = denominator > 0
+        ? clamp((marketValue + distribution - previousValue - externalFlow) / denominator, -0.95, 2)
+        : 0;
+      portfolioIndex *= 1 + dailyReturn;
+      output.push({ date: new Date(cursor), portfolio: portfolioIndex, marketValue });
+    }
+
+    previousValue = marketValue;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return output.length > 1 ? output : buildFlatPerformanceData();
 }
 
-function buildPerformanceData() {
-  const monthlyReturns = [
-    1.2, -0.8, 2.1, 1.7, -1.3, 3.4, 0.6, -2.2, 2.8, 1.4, 0.7, 2.6, -1.1, 1.9, 2.3, -0.4,
-    1.1, 3.1, -1.8, 2.2, 0.5, 1.7, 2.9, -0.6, 1.4, 2.1, -2.4, 3.6, 1.2, -0.9, 2.7, 1.5,
-    0.3, 2.4, -1.2, 2.8, 0.9, 1.6, -0.5, 2.2,
+function buildFlatPerformanceData() {
+  const value = Math.max(getTotalValue(), getTotalCost(), 1);
+  const start = new Date();
+  start.setDate(start.getDate() - 1);
+  return [
+    { date: start, portfolio: 100, marketValue: value },
+    { date: new Date(), portfolio: 100, marketValue: value },
   ];
-  const benchmarkReturns = [
-    1.0, -0.6, 1.8, 1.1, -1.0, 2.5, 0.4, -1.7, 2.2, 1.2, 0.5, 2.0, -0.9, 1.5, 1.9, -0.3,
-    0.8, 2.6, -1.4, 1.8, 0.4, 1.4, 2.2, -0.5, 1.0, 1.7, -1.8, 2.8, 1.0, -0.7, 2.0, 1.1,
-    0.2, 1.9, -0.9, 2.2, 0.7, 1.2, -0.4, 1.7,
-  ];
-  let portfolio = Math.max(getTotalCost(), getTotalValue(), 1);
-  let benchmark = portfolio;
-  const start = new Date(2023, 0, 1);
+}
 
-  return monthlyReturns.map((returnValue, index) => {
-    portfolio *= 1 + returnValue / 100;
-    benchmark *= 1 + benchmarkReturns[index] / 100;
-    const date = new Date(start);
-    date.setMonth(start.getMonth() + index);
-    return { date, portfolio, benchmark };
-  });
+function getTransactionDateKey(transaction) {
+  return parseTradeDate(transaction.sortDate || transaction.date)?.iso || "9999-12-31";
+}
+
+function toIsoDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function getHistoricalPriceForSymbol(symbol, dateKey) {
+  const normalized = normalizeSymbol(symbol);
+  const series = state.performancePriceSeries[normalized]?.points || [];
+  if (!series.length) {
+    const holding = getHoldingForAnalysis(normalized);
+    return Number(holding.price) || 0;
+  }
+
+  let lastPrice = 0;
+  for (const point of series) {
+    const pointDate = String(point.date || "").slice(0, 10);
+    if (pointDate > dateKey) break;
+    lastPrice = Number(point.value) || lastPrice;
+  }
+  if (lastPrice > 0) return lastPrice;
+  return Number(series[0]?.value) || Number(getHoldingForAnalysis(normalized).price) || 0;
 }
 
 function initializePortfolioProfiles() {
