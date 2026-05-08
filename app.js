@@ -201,8 +201,18 @@ const storageKeys = {
   manualYahooLinks: "portfolioManualYahooLinks",
   watchlists: "portfolioWatchlists",
 };
+const profileStorageKeys = {
+  profiles: "portfolioProfiles",
+  activeProfileId: "portfolioActiveProfileId",
+};
+const DEFAULT_PROFILE_ID = "main";
+const DEFAULT_PROFILE_NAME = "Main Portfolio";
+const portfolioProfileState = initializePortfolioProfiles();
+let activePortfolioProfileId = portfolioProfileState.activeProfileId;
 
 const state = {
+  profiles: portfolioProfileState.profiles,
+  activeProfileId: portfolioProfileState.activeProfileId,
   activePeriod: "1Y",
   activeFilter: "All",
   importMode: "replace",
@@ -228,6 +238,9 @@ const state = {
   selectedStockSymbol: "",
   marketMessage: "",
   marketRefreshing: false,
+  remoteDbAvailable: false,
+  remoteDbLoading: false,
+  remoteDbMessage: "",
   newsSentimentLoading: false,
   newsSentimentMessage: "",
   refreshDetail: "",
@@ -274,6 +287,7 @@ const moneyFormatters = new Map();
 document.addEventListener("DOMContentLoaded", () => {
   wireControls();
   render();
+  initializeRemotePortfolioDb();
   refreshMarketData({ quiet: true });
   refreshNewsSentiment({ quiet: true });
   window.setInterval(() => refreshMarketData({ quiet: true }), MARKET_REFRESH_MS);
@@ -306,6 +320,9 @@ function wireControls() {
   document.getElementById("bulkClearTransactions").addEventListener("click", clearSelectedTransactions);
 
   document.getElementById("refreshMarketData").addEventListener("click", () => refreshMarketData({ quiet: false }));
+  document.getElementById("portfolioProfileSelect").addEventListener("change", (event) => switchPortfolioProfile(event.target.value));
+  document.getElementById("createPortfolioProfile").addEventListener("click", createPortfolioProfile);
+  document.getElementById("deletePortfolioProfile").addEventListener("click", deleteActivePortfolioProfile);
   document.getElementById("saveStockManualYahooUrl").addEventListener("click", saveManualYahooLinkFromModal);
   document.getElementById("stockManualYahooUrl").addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return;
@@ -725,6 +742,9 @@ function wireFloatingActions() {
     if (button.dataset.action === "import") {
       openModal("importModal");
     }
+    if (button.dataset.action === "download-csv") {
+      downloadPortfolioCsv();
+    }
     if (button.dataset.action === "transaction") {
       openTransactionModal();
     }
@@ -807,10 +827,13 @@ function render() {
     year: "numeric",
   }).format(new Date());
 
-  document.getElementById("dataSourceLabel").textContent = hasSavedHoldings() ? "Local data" : "Sample data";
+  const activeProfile = getActivePortfolioProfile();
+  const storageLabel = state.remoteDbAvailable ? "Database" : hasSavedHoldings() ? "Local data" : "Sample data";
+  document.getElementById("dataSourceLabel").textContent = `${activeProfile.name} | ${storageLabel}`;
 
   renderVisibleRefreshOverlay();
   renderMarketStatus();
+  renderPortfolioProfiles();
   renderSummary();
   renderFilters();
   renderBenchmarkControls();
@@ -823,6 +846,267 @@ function render() {
   renderCharts();
   updateTransactionPreview();
   renderPortfolioChat();
+}
+
+function renderPortfolioProfiles() {
+  const select = document.getElementById("portfolioProfileSelect");
+  const deleteButton = document.getElementById("deletePortfolioProfile");
+  if (!select || !deleteButton) return;
+
+  select.innerHTML = state.profiles
+    .map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`)
+    .join("");
+  select.value = state.activeProfileId;
+  select.title = state.remoteDbAvailable ? "Profiles are stored in the database" : "Profiles are stored in this browser";
+  deleteButton.disabled = state.profiles.length <= 1;
+}
+
+async function createPortfolioProfile() {
+  const suggested = `Portfolio ${state.profiles.length + 1}`;
+  const name = window.prompt("Name this portfolio profile", suggested);
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return;
+
+  const now = new Date().toISOString();
+  let profile = {
+    id: randomId(),
+    name: cleanName.slice(0, 48),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  if (state.remoteDbAvailable) {
+    try {
+      const data = await requestDbJson("/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({ id: profile.id, name: profile.name }),
+      });
+      profile = data.profile || profile;
+    } catch (error) {
+      setStatus("importStatus", `Database profile create failed: ${error.message}`, "error");
+      return;
+    }
+  }
+
+  state.profiles = [...state.profiles, profile];
+  savePortfolioProfiles();
+  initializeBlankPortfolioProfile(profile.id);
+  switchPortfolioProfile(profile.id);
+  setStatus("importStatus", `Created ${profile.name}.`, "success");
+}
+
+async function deleteActivePortfolioProfile() {
+  if (state.profiles.length <= 1) {
+    setStatus("importStatus", "Keep at least one portfolio profile.", "error");
+    return;
+  }
+
+  const activeProfile = getActivePortfolioProfile();
+  if (!window.confirm(`Delete "${activeProfile.name}" from this browser? This cannot be undone.`)) return;
+
+  if (state.remoteDbAvailable) {
+    try {
+      await requestDbJson(`/api/profiles/${encodeURIComponent(activeProfile.id)}`, { method: "DELETE" });
+    } catch (error) {
+      setStatus("importStatus", `Database delete failed: ${error.message}`, "error");
+      return;
+    }
+  }
+
+  removePortfolioProfileStorage(activeProfile.id);
+  state.profiles = state.profiles.filter((profile) => profile.id !== activeProfile.id);
+  savePortfolioProfiles();
+  switchPortfolioProfile(state.profiles[0].id);
+  setStatus("importStatus", `Deleted ${activeProfile.name}.`, "success");
+}
+
+async function switchPortfolioProfile(profileId) {
+  const profile = state.profiles.find((item) => item.id === profileId);
+  if (!profile) return;
+
+  activePortfolioProfileId = profile.id;
+  state.activeProfileId = profile.id;
+  localStorage.setItem(profileStorageKeys.activeProfileId, profile.id);
+
+  if (state.remoteDbAvailable) {
+    await loadProfileTransactionsFromDb(profile.id).catch((error) => {
+      state.remoteDbMessage = `Database load failed: ${error.message}`;
+    });
+  } else {
+    reloadActivePortfolioProfileData();
+  }
+
+  render();
+  refreshMarketData({ quiet: true });
+  refreshNewsSentiment({ quiet: true });
+}
+
+function reloadActivePortfolioProfileData() {
+  holdings = loadHoldings();
+  trackedTickers = loadTickers();
+  state.targets = loadTargets();
+  state.transactions = loadTransactions();
+  state.fx = loadFx();
+  state.benchmarkSeries = loadBenchmarkSeries();
+  state.stockAnalysis = loadStockAnalysisCache();
+  state.newsSentiment = loadNewsSentimentCache();
+  state.manualYahooLinks = loadManualYahooLinks();
+  state.watchlists = loadWatchlists();
+  state.stockChartSeries = {};
+  state.stockChartHoverX = null;
+  state.selectedStockSymbol = "";
+  state.selectedTransactionIds = new Set();
+  state.transactionsExpanded = false;
+  state.transactionSearch = "";
+  rebuildSavedPortfolioFromTransactions();
+  ensureTickersForHoldings();
+  performanceData = buildPerformanceData();
+}
+
+function downloadPortfolioCsv() {
+  const rows = [...state.transactions].sort(compareTransactionsDesc);
+  if (!rows.length) {
+    setStatus("importStatus", "No transactions to download in this portfolio.", "error");
+    return;
+  }
+
+  const headers = ["Symbol", "Trade Date", "Price", "Quantity", "Fees", "Type", "Platform", "Class"];
+  const csvRows = rows.map(formatTransactionExportRow);
+  const csv = [headers, ...csvRows].map((row) => row.map(formatCsvCell).join(",")).join("\n");
+  const profileName = slugifyFileName(getActivePortfolioProfile().name);
+  const date = new Date().toISOString().slice(0, 10);
+  downloadTextFile(`${profileName}-portfolio-${date}.csv`, csv, "text/csv;charset=utf-8");
+  setStatus("importStatus", `Downloaded ${rows.length} transaction${rows.length === 1 ? "" : "s"} from ${getActivePortfolioProfile().name}.`, "success");
+}
+
+function formatTransactionExportRow(transaction) {
+  return [
+    transaction.symbol === "CASH" ? "" : transaction.symbol,
+    formatExportTradeDate(transaction),
+    formatCsvNumber(transaction.price),
+    formatCsvNumber(transaction.quantity),
+    Number(transaction.fees) ? formatCsvNumber(transaction.fees) : "",
+    String(transaction.type || "").toUpperCase(),
+    transaction.platform || "Other",
+    formatExportAssetClass(transaction.assetClass),
+  ];
+}
+
+function formatExportTradeDate(transaction) {
+  const parsed = parseTradeDate(transaction.sortDate || transaction.date);
+  if (!parsed) return "";
+  return parsed.iso.replace(/-/g, "");
+}
+
+function formatCsvNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? String(Number(number.toFixed(8))).replace(/\.0+$/, "") : "";
+}
+
+function formatExportAssetClass(assetClass) {
+  const normalized = String(assetClass || "").trim();
+  if (/^(stocks?|equity)$/i.test(normalized)) return "Stock";
+  return normalized || "Stock";
+}
+
+function formatCsvCell(value) {
+  const text = String(value ?? "");
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function downloadTextFile(filename, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function slugifyFileName(value) {
+  return String(value || "portfolio")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "portfolio";
+}
+
+async function initializeRemotePortfolioDb() {
+  state.remoteDbLoading = true;
+  try {
+    const status = await requestDbJson("/api/db-status", { method: "GET" });
+    state.remoteDbAvailable = Boolean(status.enabled);
+    if (!state.remoteDbAvailable) {
+      state.remoteDbMessage = status.error || "Using browser storage.";
+      return;
+    }
+
+    const data = await requestDbJson("/api/profiles", { method: "GET" });
+    const profiles = Array.isArray(data.profiles) ? data.profiles.map(normalizePortfolioProfile).filter(Boolean) : [];
+    if (profiles.length) {
+      state.profiles = profiles;
+      savePortfolioProfiles();
+      const savedActive = localStorage.getItem(profileStorageKeys.activeProfileId);
+      const active = profiles.find((profile) => profile.id === savedActive) || profiles[0];
+      activePortfolioProfileId = active.id;
+      state.activeProfileId = active.id;
+      localStorage.setItem(profileStorageKeys.activeProfileId, active.id);
+      await loadProfileTransactionsFromDb(active.id);
+    }
+    state.remoteDbMessage = "Profiles and transactions are stored in the database.";
+  } catch (error) {
+    state.remoteDbAvailable = false;
+    state.remoteDbMessage = `Using browser storage: ${error.message}`;
+  } finally {
+    state.remoteDbLoading = false;
+    render();
+  }
+}
+
+async function loadProfileTransactionsFromDb(profileId) {
+  const data = await requestDbJson(`/api/profiles/${encodeURIComponent(profileId)}/transactions`, { method: "GET" });
+  state.transactions = Array.isArray(data.transactions) ? data.transactions.map(normalizeStoredTransaction).sort(compareTransactionsDesc) : [];
+  saveTransactions({ skipRemoteSync: true });
+  const rebuilt = rebuildPortfolioFromTransactions(state.transactions);
+  state.transactions = rebuilt.transactions.sort(compareTransactionsDesc);
+  saveTransactions({ skipRemoteSync: true });
+  saveHoldings();
+  saveTickers();
+  ensureTickersForHoldings();
+  performanceData = buildPerformanceData();
+}
+
+function syncActiveProfileTransactionsToDb() {
+  if (!state.remoteDbAvailable || !state.activeProfileId) return;
+  window.clearTimeout(syncActiveProfileTransactionsToDb.timer);
+  syncActiveProfileTransactionsToDb.timer = window.setTimeout(async () => {
+    try {
+      await requestDbJson(`/api/profiles/${encodeURIComponent(state.activeProfileId)}/transactions`, {
+        method: "PUT",
+        body: JSON.stringify({ transactions: state.transactions }),
+      });
+      state.remoteDbMessage = "Transactions synced to database.";
+    } catch (error) {
+      state.remoteDbMessage = `Database sync failed: ${error.message}`;
+      setStatus("importStatus", state.remoteDbMessage, "error");
+    }
+  }, 250);
+}
+
+async function requestDbJson(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Database request failed with HTTP ${response.status}`);
+  return data;
 }
 
 function wireDonutHover(canvasId) {
@@ -5686,10 +5970,108 @@ function buildPerformanceData() {
   });
 }
 
+function initializePortfolioProfiles() {
+  const now = new Date().toISOString();
+  let profiles = loadStoredPortfolioProfiles();
+  if (!profiles.length) {
+    profiles = [{ id: DEFAULT_PROFILE_ID, name: DEFAULT_PROFILE_NAME, createdAt: now, updatedAt: now }];
+  }
+
+  let activeProfileId = localStorage.getItem(profileStorageKeys.activeProfileId) || DEFAULT_PROFILE_ID;
+  if (!profiles.some((profile) => profile.id === activeProfileId)) activeProfileId = profiles[0].id;
+
+  localStorage.setItem(profileStorageKeys.activeProfileId, activeProfileId);
+  writeStoredPortfolioProfiles(profiles);
+  return { profiles, activeProfileId };
+}
+
+function loadStoredPortfolioProfiles() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(profileStorageKeys.profiles) || "[]");
+    return Array.isArray(saved) ? saved.map(normalizePortfolioProfile).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizePortfolioProfile(profile) {
+  const id = String(profile?.id || "").trim();
+  const name = String(profile?.name || "").trim();
+  if (!id || !name) return null;
+  return {
+    id,
+    name: name.slice(0, 48),
+    createdAt: profile.createdAt || new Date().toISOString(),
+    updatedAt: profile.updatedAt || profile.createdAt || new Date().toISOString(),
+  };
+}
+
+function writeStoredPortfolioProfiles(profiles) {
+  localStorage.setItem(profileStorageKeys.profiles, JSON.stringify(profiles));
+}
+
+function savePortfolioProfiles() {
+  writeStoredPortfolioProfiles(state.profiles);
+}
+
+function getActivePortfolioProfile() {
+  return state.profiles.find((profile) => profile.id === state.activeProfileId) || state.profiles[0] || {
+    id: DEFAULT_PROFILE_ID,
+    name: DEFAULT_PROFILE_NAME,
+  };
+}
+
+function getProfileStorageKey(baseKey, profileId = activePortfolioProfileId) {
+  return `${baseKey}:${profileId || DEFAULT_PROFILE_ID}`;
+}
+
+function getProfileStorageItem(baseKey) {
+  const profileValue = localStorage.getItem(getProfileStorageKey(baseKey));
+  if (profileValue !== null) return profileValue;
+  if ((activePortfolioProfileId || DEFAULT_PROFILE_ID) === DEFAULT_PROFILE_ID) return localStorage.getItem(baseKey);
+  return null;
+}
+
+function setProfileStorageItem(baseKey, value) {
+  localStorage.setItem(getProfileStorageKey(baseKey), value);
+  touchActivePortfolioProfile();
+}
+
+function touchActivePortfolioProfile() {
+  if (!Array.isArray(state.profiles)) return;
+  const profile = state.profiles.find((item) => item.id === state.activeProfileId);
+  if (!profile) return;
+  profile.updatedAt = new Date().toISOString();
+  savePortfolioProfiles();
+}
+
+function initializeBlankPortfolioProfile(profileId) {
+  localStorage.setItem(getProfileStorageKey(storageKeys.holdings, profileId), JSON.stringify([]));
+  localStorage.setItem(getProfileStorageKey(storageKeys.tickers, profileId), JSON.stringify([]));
+  localStorage.setItem(getProfileStorageKey(storageKeys.transactions, profileId), JSON.stringify([]));
+  localStorage.setItem(getProfileStorageKey(storageKeys.targets, profileId), JSON.stringify(defaultTargets));
+  localStorage.setItem(getProfileStorageKey(storageKeys.fx, profileId), JSON.stringify(defaultFx));
+  localStorage.setItem(getProfileStorageKey(storageKeys.benchmarks, profileId), JSON.stringify({}));
+  localStorage.setItem(getProfileStorageKey(storageKeys.stockAnalysis, profileId), JSON.stringify({}));
+  localStorage.setItem(getProfileStorageKey(storageKeys.newsSentiment, profileId), JSON.stringify({}));
+  localStorage.setItem(getProfileStorageKey(storageKeys.manualYahooLinks, profileId), JSON.stringify({}));
+  localStorage.setItem(getProfileStorageKey(storageKeys.watchlists, profileId), JSON.stringify([]));
+}
+
+function removePortfolioProfileStorage(profileId) {
+  Object.values(storageKeys).forEach((baseKey) => {
+    localStorage.removeItem(getProfileStorageKey(baseKey, profileId));
+  });
+}
+
 function loadHoldings() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.holdings) || "null");
-    return Array.isArray(saved) && saved.length ? saved.map(normalizeHolding) : clone(sampleHoldings).map(normalizeHolding);
+    const raw = getProfileStorageItem(storageKeys.holdings);
+    if (raw !== null) {
+      const saved = JSON.parse(raw);
+      return Array.isArray(saved) ? saved.map(normalizeHolding) : [];
+    }
+    return clone(sampleHoldings).map(normalizeHolding);
   } catch {
     return clone(sampleHoldings).map(normalizeHolding);
   }
@@ -5697,7 +6079,7 @@ function loadHoldings() {
 
 function loadTickers() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.tickers) || "[]");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.tickers) || "[]");
     return Array.isArray(saved) ? saved.map(normalizeTicker) : [];
   } catch {
     return [];
@@ -5706,7 +6088,7 @@ function loadTickers() {
 
 function loadTargets() {
   try {
-    return { ...defaultTargets, ...JSON.parse(localStorage.getItem(storageKeys.targets) || "{}") };
+    return { ...defaultTargets, ...JSON.parse(getProfileStorageItem(storageKeys.targets) || "{}") };
   } catch {
     return { ...defaultTargets };
   }
@@ -5714,7 +6096,7 @@ function loadTargets() {
 
 function loadTransactions() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.transactions) || "[]");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.transactions) || "[]");
     return Array.isArray(saved) ? saved : [];
   } catch {
     return [];
@@ -5723,7 +6105,7 @@ function loadTransactions() {
 
 function loadFx() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.fx) || "null");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.fx) || "null");
     return saved?.ratesToEUR?.USD ? saved : clone(defaultFx);
   } catch {
     return clone(defaultFx);
@@ -5732,7 +6114,7 @@ function loadFx() {
 
 function loadBenchmarkSeries() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.benchmarks) || "{}");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.benchmarks) || "{}");
     return saved && typeof saved === "object" ? saved : {};
   } catch {
     return {};
@@ -5741,7 +6123,7 @@ function loadBenchmarkSeries() {
 
 function loadStockAnalysisCache() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.stockAnalysis) || "{}");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.stockAnalysis) || "{}");
     return saved && typeof saved === "object" ? saved : {};
   } catch {
     return {};
@@ -5750,7 +6132,7 @@ function loadStockAnalysisCache() {
 
 function loadNewsSentimentCache() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.newsSentiment) || "{}");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.newsSentiment) || "{}");
     if (!saved || typeof saved !== "object") return {};
     return Object.fromEntries(
       Object.entries(saved)
@@ -5764,7 +6146,7 @@ function loadNewsSentimentCache() {
 
 function loadManualYahooLinks() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.manualYahooLinks) || "{}");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.manualYahooLinks) || "{}");
     return saved && typeof saved === "object" ? saved : {};
   } catch {
     return {};
@@ -5773,7 +6155,7 @@ function loadManualYahooLinks() {
 
 function loadWatchlists() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKeys.watchlists) || "[]");
+    const saved = JSON.parse(getProfileStorageItem(storageKeys.watchlists) || "[]");
     return Array.isArray(saved) ? saved.map(normalizeStoredWatchlist).filter(Boolean) : [];
   } catch {
     return [];
@@ -5796,47 +6178,48 @@ function normalizeStoredWatchlist(watchlist) {
   };
 }
 function saveHoldings() {
-  localStorage.setItem(storageKeys.holdings, JSON.stringify(holdings));
+  setProfileStorageItem(storageKeys.holdings, JSON.stringify(holdings));
 }
 
 function saveTickers() {
-  localStorage.setItem(storageKeys.tickers, JSON.stringify(trackedTickers));
+  setProfileStorageItem(storageKeys.tickers, JSON.stringify(trackedTickers));
 }
 
 function saveTargets() {
-  localStorage.setItem(storageKeys.targets, JSON.stringify(state.targets));
+  setProfileStorageItem(storageKeys.targets, JSON.stringify(state.targets));
 }
 
-function saveTransactions() {
-  localStorage.setItem(storageKeys.transactions, JSON.stringify(state.transactions));
+function saveTransactions(options = {}) {
+  setProfileStorageItem(storageKeys.transactions, JSON.stringify(state.transactions));
+  if (!options.skipRemoteSync) syncActiveProfileTransactionsToDb();
 }
 
 function saveFx() {
-  localStorage.setItem(storageKeys.fx, JSON.stringify(state.fx));
+  setProfileStorageItem(storageKeys.fx, JSON.stringify(state.fx));
 }
 
 function saveBenchmarkSeries() {
-  localStorage.setItem(storageKeys.benchmarks, JSON.stringify(state.benchmarkSeries));
+  setProfileStorageItem(storageKeys.benchmarks, JSON.stringify(state.benchmarkSeries));
 }
 
 function saveStockAnalysisCache() {
-  localStorage.setItem(storageKeys.stockAnalysis, JSON.stringify(state.stockAnalysis));
+  setProfileStorageItem(storageKeys.stockAnalysis, JSON.stringify(state.stockAnalysis));
 }
 
 function saveNewsSentimentCache() {
-  localStorage.setItem(storageKeys.newsSentiment, JSON.stringify(state.newsSentiment));
+  setProfileStorageItem(storageKeys.newsSentiment, JSON.stringify(state.newsSentiment));
 }
 
 function saveManualYahooLinks() {
-  localStorage.setItem(storageKeys.manualYahooLinks, JSON.stringify(state.manualYahooLinks));
+  setProfileStorageItem(storageKeys.manualYahooLinks, JSON.stringify(state.manualYahooLinks));
 }
 
 function saveWatchlists() {
-  localStorage.setItem(storageKeys.watchlists, JSON.stringify(state.watchlists));
+  setProfileStorageItem(storageKeys.watchlists, JSON.stringify(state.watchlists));
 }
 
 function hasSavedHoldings() {
-  return Boolean(localStorage.getItem(storageKeys.holdings));
+  return getProfileStorageItem(storageKeys.holdings) !== null;
 }
 
 function ensureTransactionIds() {

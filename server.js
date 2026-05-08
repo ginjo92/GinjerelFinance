@@ -14,6 +14,11 @@ const STOCK_HISTORY_MAX_DAYS = 1825;
 const STOCK_HISTORY_CANDIDATE_LIMIT = 12;
 const STOCK_QUOTE_ITEM_LIMIT = 40;
 const STOCK_QUOTE_CANDIDATE_LIMIT = 10;
+const DEFAULT_PROFILE_ID = "main";
+const DEFAULT_PROFILE_NAME = "Main Portfolio";
+
+let dbPool = null;
+let dbReadyPromise = null;
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -41,6 +46,28 @@ const server = http.createServer(async (req, res) => {
     }
 
     const requestUrl = new URL(req.url, `http://localhost:${PORT}`);
+    if (requestUrl.pathname === "/api/db-status") {
+      await handleDbStatus(req, res);
+      return;
+    }
+
+    if (requestUrl.pathname === "/api/profiles") {
+      await handleProfiles(req, res);
+      return;
+    }
+
+    const profileTransactionsMatch = requestUrl.pathname.match(/^\/api\/profiles\/([^/]+)\/transactions$/);
+    if (profileTransactionsMatch) {
+      await handleProfileTransactions(req, res, profileTransactionsMatch[1]);
+      return;
+    }
+
+    const profileMatch = requestUrl.pathname.match(/^\/api\/profiles\/([^/]+)$/);
+    if (profileMatch) {
+      await handleProfileById(req, res, profileMatch[1]);
+      return;
+    }
+
     if (req.method === "POST" && requestUrl.pathname === "/api/quotes") {
       await handleStockQuotes(req, res);
       return;
@@ -151,6 +178,96 @@ async function handleNewsSentiment(req, res, requestUrl) {
     windowDays: days,
     items,
   });
+}
+
+async function handleDbStatus(req, res) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  try {
+    await ensureDb();
+    sendJson(res, 200, { enabled: true, provider: "postgres" });
+  } catch (error) {
+    sendJson(res, process.env.DATABASE_URL ? 500 : 200, {
+      enabled: false,
+      provider: process.env.DATABASE_URL ? "postgres" : "browser",
+      error: process.env.DATABASE_URL ? error.message : "DATABASE_URL is not set.",
+    });
+  }
+}
+
+async function handleProfiles(req, res) {
+  try {
+    await ensureDb();
+    if (req.method === "GET") {
+      const profiles = await listDbProfiles();
+      sendJson(res, 200, { profiles });
+      return;
+    }
+
+    if (req.method === "POST") {
+      const payload = await readJsonBody(req);
+      const profile = await createDbProfile(payload);
+      sendJson(res, 201, { profile });
+      return;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
+  } catch (error) {
+    sendJson(res, getDbErrorStatus(error), { error: error.message });
+  }
+}
+
+async function handleProfileById(req, res, rawProfileId) {
+  try {
+    await ensureDb();
+    const profileId = normalizeProfileId(rawProfileId);
+    if (!profileId) {
+      sendJson(res, 400, { error: "Invalid profile id." });
+      return;
+    }
+
+    if (req.method === "DELETE") {
+      await deleteDbProfile(profileId);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
+  } catch (error) {
+    sendJson(res, getDbErrorStatus(error), { error: error.message });
+  }
+}
+
+async function handleProfileTransactions(req, res, rawProfileId) {
+  try {
+    await ensureDb();
+    const profileId = normalizeProfileId(rawProfileId);
+    if (!profileId) {
+      sendJson(res, 400, { error: "Invalid profile id." });
+      return;
+    }
+
+    if (req.method === "GET") {
+      const transactions = await listDbTransactions(profileId);
+      sendJson(res, 200, { profileId, transactions });
+      return;
+    }
+
+    if (req.method === "PUT") {
+      const payload = await readJsonBody(req);
+      const transactions = Array.isArray(payload.transactions) ? payload.transactions : [];
+      await replaceDbTransactions(profileId, transactions);
+      sendJson(res, 200, { profileId, count: transactions.length });
+      return;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
+  } catch (error) {
+    sendJson(res, getDbErrorStatus(error), { error: error.message });
+  }
 }
 
 async function handleStockHistory(req, res, requestUrl) {
@@ -779,6 +896,152 @@ function normalizeCurrency(value) {
   const currency = String(value || "USD").trim().toUpperCase();
   return ["USD", "EUR"].includes(currency) ? currency : "USD";
 }
+
+async function ensureDb() {
+  if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is not set.");
+  if (!dbReadyPromise) dbReadyPromise = initializeDb();
+  await dbReadyPromise;
+  return dbPool;
+}
+
+async function initializeDb() {
+  let pg;
+  try {
+    pg = require("pg");
+  } catch {
+    throw new Error("Postgres dependency is not installed. Run npm install.");
+  }
+
+  dbPool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+  });
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS portfolio_profiles (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS portfolio_transactions (
+      profile_id TEXT NOT NULL REFERENCES portfolio_profiles(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      data JSONB NOT NULL,
+      sort_date TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (profile_id, id)
+    )
+  `);
+  await dbPool.query(
+    `INSERT INTO portfolio_profiles (id, name)
+     VALUES ($1, $2)
+     ON CONFLICT (id) DO NOTHING`,
+    [DEFAULT_PROFILE_ID, DEFAULT_PROFILE_NAME],
+  );
+}
+
+async function listDbProfiles() {
+  const result = await dbPool.query(
+    `SELECT id, name, created_at, updated_at
+     FROM portfolio_profiles
+     ORDER BY created_at ASC, name ASC`,
+  );
+  return result.rows.map(formatDbProfile);
+}
+
+async function createDbProfile(payload = {}) {
+  const id = normalizeProfileId(payload.id || randomServerId());
+  const name = normalizeProfileName(payload.name);
+  if (!id || !name) throw new Error("Profile name is required.");
+
+  const result = await dbPool.query(
+    `INSERT INTO portfolio_profiles (id, name)
+     VALUES ($1, $2)
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()
+     RETURNING id, name, created_at, updated_at`,
+    [id, name],
+  );
+  return formatDbProfile(result.rows[0]);
+}
+
+async function deleteDbProfile(profileId) {
+  if (profileId === DEFAULT_PROFILE_ID) throw new Error("The main profile cannot be deleted from the database.");
+  const result = await dbPool.query("DELETE FROM portfolio_profiles WHERE id = $1", [profileId]);
+  if (!result.rowCount) throw new Error("Profile not found.");
+}
+
+async function listDbTransactions(profileId) {
+  const result = await dbPool.query(
+    `SELECT data
+     FROM portfolio_transactions
+     WHERE profile_id = $1
+     ORDER BY sort_date DESC NULLS LAST, created_at DESC`,
+    [profileId],
+  );
+  return result.rows.map((row) => row.data);
+}
+
+async function replaceDbTransactions(profileId, transactions) {
+  await dbPool.query(
+    `INSERT INTO portfolio_profiles (id, name)
+     VALUES ($1, $2)
+     ON CONFLICT (id) DO NOTHING`,
+    [profileId, profileId === DEFAULT_PROFILE_ID ? DEFAULT_PROFILE_NAME : "Portfolio"],
+  );
+
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM portfolio_transactions WHERE profile_id = $1", [profileId]);
+    for (const transaction of transactions) {
+      const id = normalizeProfileId(transaction?.id || randomServerId());
+      await client.query(
+        `INSERT INTO portfolio_transactions (profile_id, id, data, sort_date)
+         VALUES ($1, $2, $3::jsonb, $4)`,
+        [profileId, id, JSON.stringify({ ...transaction, id }), String(transaction?.sortDate || transaction?.date || "")],
+      );
+    }
+    await client.query("UPDATE portfolio_profiles SET updated_at = NOW() WHERE id = $1", [profileId]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function formatDbProfile(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+  };
+}
+
+function normalizeProfileId(value) {
+  return String(value || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+}
+
+function normalizeProfileName(value) {
+  return String(value || "").trim().slice(0, 80);
+}
+
+function randomServerId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getDbErrorStatus(error) {
+  if (/not set|not installed/i.test(error.message || "")) return 503;
+  if (/not found/i.test(error.message || "")) return 404;
+  return 500;
+}
+
 function clampNumber(value, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return min;

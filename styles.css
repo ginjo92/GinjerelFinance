@@ -205,6 +205,34 @@ button {
   gap: 10px;
 }
 
+.profile-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 42px;
+  padding: 0 6px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.profile-switcher select {
+  width: clamp(128px, 14vw, 190px);
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+  outline: 0;
+}
+
+.profile-switcher .icon-button {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
 .market-status {
   display: inline-flex;
   align-items: center;
@@ -1888,6 +1916,7 @@ td {
   }
 
   .topbar-actions,
+  .profile-switcher,
   .search-box,
   .market-status,
   .segmented-control,
@@ -1897,6 +1926,11 @@ td {
 
   .topbar-actions {
     align-items: stretch;
+  }
+
+  .profile-switcher select {
+    width: 100%;
+    flex: 1;
   }
 
   .top-add-wrapper,
