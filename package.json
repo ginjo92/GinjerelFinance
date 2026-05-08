@@ -1,0 +1,12 @@
+{
+  "name": "ginjerelfinance",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local GinjerelFinance dashboard with an optional AI portfolio coach backend.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
