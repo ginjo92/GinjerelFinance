@@ -1,6 +1,7 @@
 const BASE_CURRENCY = "EUR";
 const MARKET_REFRESH_MS = 60_000;
 const NEWS_SENTIMENT_REFRESH_MS = 30 * 60 * 1000;
+const PERFORMANCE_HISTORY_MAX_DAYS = 36500;
 const TRANSACTION_PREVIEW_LIMIT = 10;
 const WATCHLIST_ACTION_LIMIT = 8;
 
@@ -205,7 +206,6 @@ let activePortfolioProfileId = portfolioProfileState.activeProfileId;
 const state = {
   profiles: portfolioProfileState.profiles,
   activeProfileId: portfolioProfileState.activeProfileId,
-  activePeriod: "1Y",
   activeFilter: "All",
   importMode: "replace",
   search: "",
@@ -379,15 +379,6 @@ function wireControls() {
     setActiveButton(document.getElementById("importMode"), button);
   });
 
-  document.getElementById("periodControls").addEventListener("click", (event) => {
-    const button = event.target.closest("button");
-    if (!button) return;
-    state.activePeriod = button.dataset.period;
-    state.performanceHoverX = null;
-    setActiveButton(document.getElementById("periodControls"), button);
-    renderPerformanceChart();
-  });
-
   document.getElementById("benchmarkControls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-benchmark]");
     if (!button) return;
@@ -400,7 +391,7 @@ function wireControls() {
     }
     renderBenchmarkControls();
     renderPerformanceChart();
-    if (!wasActive && !state.benchmarkSeries[id]?.length) refreshBenchmarkOnDemand(id);
+    if (!wasActive && !benchmarkSeriesCoversPerformanceWindow(state.benchmarkSeries[id])) refreshBenchmarkOnDemand(id);
   });
 
   document.getElementById("assetFilters").addEventListener("click", (event) => {
@@ -831,6 +822,7 @@ function render() {
   renderPortfolioProfiles();
   renderSummary();
   renderFilters();
+  renderPerformanceRangeLabel();
   renderBenchmarkControls();
   renderFormOptions();
   renderHoldings();
@@ -2109,7 +2101,7 @@ function getStockHistoryEndpoint(candidates, days = 760) {
       .slice(0, 12)
       .map((candidate) => `${candidate.symbol}:${candidate.currency}`)
       .join(","),
-    days: String(clamp(Number(days) || 760, 30, 1825)),
+    days: String(clamp(Number(days) || 760, 30, PERFORMANCE_HISTORY_MAX_DAYS)),
   });
   const path = `/api/stock-history?${params.toString()}`;
   if (/^https?:$/i.test(window.location.protocol)) return path;
@@ -4128,6 +4120,14 @@ function renderChartLegend(lines) {
     .join("");
 }
 
+function renderPerformanceRangeLabel() {
+  const label = document.getElementById("performanceRangeLabel");
+  if (!label) return;
+
+  const firstDate = getFirstTransactionDate();
+  label.textContent = firstDate ? `Since ${formatMonth(new Date(`${firstDate}T00:00:00`))}` : "Since first transaction";
+}
+
 function renderInvestorProfile() {
   const profile = buildInvestorProfile();
 
@@ -4587,13 +4587,18 @@ function getPerformanceHistorySubjects() {
 }
 
 function getPerformanceHistoryDays() {
-  const times = state.transactions
-    .map((transaction) => Date.parse(transaction.sortDate || parseTradeDate(transaction.date)?.iso || ""))
-    .filter(Number.isFinite);
-  if (!times.length) return 760;
-  const first = Math.min(...times);
+  const firstDate = getFirstTransactionDate();
+  if (!firstDate) return 760;
+  const first = new Date(`${firstDate}T00:00:00`).getTime();
   const days = Math.ceil((Date.now() - first) / (24 * 60 * 60 * 1000)) + 14;
-  return clamp(days, 45, 1825);
+  return clamp(days, 45, PERFORMANCE_HISTORY_MAX_DAYS);
+}
+
+function getFirstTransactionDate() {
+  return state.transactions
+    .map((transaction) => parseTradeDate(transaction.sortDate || transaction.date)?.iso || "")
+    .filter(Boolean)
+    .sort()[0] || "";
 }
 
 async function refreshTickerNames() {
@@ -4713,7 +4718,7 @@ async function refreshBenchmarks(ids = state.activeBenchmarks) {
   let available = 0;
 
   for (const benchmark of benchmarks) {
-    if (state.benchmarkSeries[benchmark.id]?.length > 1) {
+    if (benchmarkSeriesCoversPerformanceWindow(state.benchmarkSeries[benchmark.id])) {
       available += 1;
       continue;
     }
@@ -4725,6 +4730,18 @@ async function refreshBenchmarks(ids = state.activeBenchmarks) {
   }
 
   return { updated: available, total: benchmarks.length };
+}
+
+function benchmarkSeriesCoversPerformanceWindow(series) {
+  if (!Array.isArray(series) || series.length < 2) return false;
+  const window = getPortfolioPerformanceDateWindow();
+  const first = Date.parse(series[0]?.date);
+  const last = Date.parse(series[series.length - 1]?.date);
+  const tolerance = 10 * 24 * 60 * 60 * 1000;
+  return Number.isFinite(first)
+    && Number.isFinite(last)
+    && first <= window.start.getTime() + tolerance
+    && last >= window.end.getTime() - tolerance;
 }
 
 async function fetchBenchmarkHistory(benchmark) {
@@ -6038,19 +6055,17 @@ function drawAxisLabels(ctx, dateDomain, width, height, padding) {
 }
 
 function filterPerformanceData() {
-  if (state.activePeriod === "ALL") return performanceData;
-  const startDate = getPeriodStartDate();
-  const filtered = performanceData.filter((point) => new Date(point.date) >= startDate);
-  return filtered.length > 1 ? filtered : performanceData.slice(-2);
+  return performanceData;
 }
 
 function filterBenchmarkSeries(id) {
   const source = state.benchmarkSeries[id]?.length ? state.benchmarkSeries[id] : [];
-  const startDate = getPeriodStartDate();
-  const filtered = state.activePeriod === "ALL"
-    ? source
-    : source.filter((point) => new Date(point.date) >= startDate);
-  return (filtered.length > 1 ? filtered : source.slice(-2)).map((point) => ({
+  const window = getPortfolioPerformanceDateWindow();
+  const filtered = source.filter((point) => {
+    const date = new Date(point.date);
+    return date >= window.start && date <= window.end;
+  });
+  return filtered.map((point) => ({
     date: new Date(point.date),
     value: Number(point.value) || 0,
   }));
@@ -6065,13 +6080,21 @@ function normalizeSeries(points) {
   }));
 }
 
-function getPeriodStartDate() {
-  const now = new Date();
-  const start = new Date(now);
-  if (state.activePeriod === "6M") start.setMonth(now.getMonth() - 6);
-  if (state.activePeriod === "1Y") start.setFullYear(now.getFullYear() - 1);
-  if (state.activePeriod === "3Y") start.setFullYear(now.getFullYear() - 3);
-  return start;
+function getPortfolioPerformanceDateWindow() {
+  const points = performanceData
+    .map((point) => point.date instanceof Date ? point.date : new Date(point.date))
+    .filter((date) => Number.isFinite(date.getTime()));
+  if (points.length) {
+    return {
+      start: points[0],
+      end: points[points.length - 1],
+    };
+  }
+
+  const firstDate = getFirstTransactionDate();
+  const end = new Date();
+  const start = firstDate ? new Date(`${firstDate}T00:00:00`) : new Date(end.getTime() - 24 * 60 * 60 * 1000);
+  return { start, end };
 }
 
 function buildPerformanceData() {
@@ -6085,10 +6108,7 @@ function buildPerformanceData() {
   const firstDate = parseTradeDate(transactions[0].sortDate || transactions[0].date)?.iso;
   if (!firstDate) return buildFlatPerformanceData();
 
-  const start = new Date(`${firstDate}T00:00:00`);
-  const maxLookbackStart = new Date();
-  maxLookbackStart.setDate(maxLookbackStart.getDate() - 1825);
-  const cursor = start < maxLookbackStart ? maxLookbackStart : start;
+  const cursor = new Date(`${firstDate}T00:00:00`);
   const today = new Date();
   const quantities = {};
   const output = [];
