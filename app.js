@@ -4094,9 +4094,10 @@ function renderDonutLegend(id, data) {
 }
 
 function getPerformanceLines() {
-  const portfolioPoints = normalizeSeries(
-    filterPerformanceData().map((point) => ({ date: point.date, value: point.portfolio })),
-  );
+  const portfolioPoints = filterPerformanceData().map((point) => ({
+    date: point.date instanceof Date ? point.date : new Date(point.date),
+    value: Number(point.portfolio) || 100,
+  }));
   const benchmarkLines = state.activeBenchmarks
     .map((id) => benchmarkDefinitions.find((benchmark) => benchmark.id === id))
     .filter(Boolean)
@@ -6110,11 +6111,9 @@ function buildPerformanceData() {
 
   const cursor = new Date(`${firstDate}T00:00:00`);
   const today = new Date();
-  const quantities = {};
+  const positions = new Map();
   const output = [];
   let transactionIndex = 0;
-  let previousValue = 0;
-  let portfolioIndex = 100;
 
   while (cursor <= today) {
     const dateKey = toIsoDate(cursor);
@@ -6124,50 +6123,79 @@ function buildPerformanceData() {
       transactionIndex += 1;
     }
 
-    let externalFlow = 0;
-    let distribution = 0;
     dayTransactions.forEach((transaction) => {
       const symbol = normalizeSymbol(transaction.symbol);
+      if (!symbol || symbol === "CASH") return;
+
+      const key = holdingKey(symbol, transaction.platform);
+      const position = positions.get(key) || {
+        symbol,
+        platform: transaction.platform,
+        currency: transaction.currency,
+        quantity: 0,
+        costBasisEUR: 0,
+      };
       const currency = normalizeCurrency(transaction.currency || BASE_CURRENCY);
       const quantity = Number(transaction.quantity) || 0;
       const price = Number(transaction.price) || 0;
       const fees = Number(transaction.fees) || 0;
-      const amount = getTransactionAmount(transaction.type, quantity, price);
 
-      if (transaction.type === "buy" && symbol && symbol !== "CASH") {
-        quantities[symbol] = (quantities[symbol] || 0) + quantity;
-        externalFlow += toEUR(amount + fees, currency);
-      } else if (transaction.type === "sell" && symbol && symbol !== "CASH") {
-        quantities[symbol] = (quantities[symbol] || 0) - quantity;
-        externalFlow -= toEUR(Math.max(amount - fees, 0), currency);
-      } else if (transaction.type === "dividend") {
-        distribution += toEUR(Math.max(amount - fees, 0), currency);
-      } else if (transaction.type === "fee") {
-        distribution -= toEUR(amount + fees, currency);
+      if (transaction.type === "buy") {
+        position.quantity += quantity;
+        position.costBasisEUR += toEUR(quantity * price + fees, currency);
+        position.currency = currency;
+      } else if (transaction.type === "sell" && position.quantity > 0) {
+        const soldQuantity = Math.min(quantity, position.quantity);
+        const soldRatio = soldQuantity / position.quantity;
+        position.quantity = Math.max(position.quantity - soldQuantity, 0);
+        position.costBasisEUR = position.quantity > 0 ? Math.max(position.costBasisEUR * (1 - soldRatio), 0) : 0;
+        position.currency = currency;
+      } else if (isStockQuantityAdjustment(transaction)) {
+        position.quantity += quantity;
+        position.currency = currency;
       }
+
+      positions.set(key, position);
     });
 
-    const marketValue = Object.entries(quantities).reduce((sum, [symbol, quantity]) => {
-      if (Math.abs(quantity) < 0.0000001) return sum;
-      const price = getHistoricalPriceForSymbol(symbol, dateKey);
-      const currency = normalizeCurrency(state.performancePriceSeries[symbol]?.currency || getHoldingForAnalysis(symbol).currency || BASE_CURRENCY);
-      return sum + toEUR(quantity * price, currency);
+    const openPositions = [...positions.values()].filter((position) =>
+      Math.abs(position.quantity) > 0.0000001 && position.costBasisEUR > 0,
+    );
+    const marketValue = openPositions.reduce((sum, position) => {
+      const price = getPerformancePriceForPosition(position, dateKey);
+      const currency = getPerformanceCurrencyForSymbol(position.symbol, position.currency, dateKey);
+      return sum + toEUR(position.quantity * price, currency);
     }, 0);
+    const costBasis = openPositions.reduce((sum, position) => sum + position.costBasisEUR, 0);
 
-    const denominator = previousValue + Math.max(externalFlow, 0);
-    if (previousValue > 0 || denominator > 0) {
-      const dailyReturn = denominator > 0
-        ? clamp((marketValue + distribution - previousValue - externalFlow) / denominator, -0.95, 2)
-        : 0;
-      portfolioIndex *= 1 + dailyReturn;
-      output.push({ date: new Date(cursor), portfolio: portfolioIndex, marketValue });
+    if (costBasis > 0) {
+      output.push({
+        date: new Date(cursor),
+        portfolio: (marketValue / costBasis) * 100,
+        marketValue,
+        costBasis,
+      });
     }
 
-    previousValue = marketValue;
     cursor.setDate(cursor.getDate() + 1);
   }
 
-  return output.length > 1 ? output : buildFlatPerformanceData();
+  return output.length > 1 ? alignLatestPerformancePoint(output) : buildFlatPerformanceData();
+}
+
+function alignLatestPerformancePoint(points) {
+  const totalCost = getTotalCost();
+  const totalValue = getTotalValue();
+  if (totalCost <= 0 || !points.length) return points;
+
+  points[points.length - 1] = {
+    ...points[points.length - 1],
+    date: new Date(),
+    portfolio: (totalValue / totalCost) * 100,
+    marketValue: totalValue,
+    costBasis: totalCost,
+  };
+  return points;
 }
 
 function buildFlatPerformanceData() {
@@ -6186,6 +6214,39 @@ function getTransactionDateKey(transaction) {
 
 function toIsoDate(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function getPerformancePriceForPosition(position, dateKey) {
+  const symbol = normalizeSymbol(position.symbol);
+  if (dateKey >= toIsoDate(new Date())) return getPerformancePriceForSymbol(symbol, dateKey);
+
+  const series = state.performancePriceSeries[symbol]?.points || [];
+  if (!series.length && position.quantity > 0 && position.costBasisEUR > 0) {
+    return fromEUR(position.costBasisEUR, position.currency || BASE_CURRENCY) / position.quantity;
+  }
+
+  return getPerformancePriceForSymbol(symbol, dateKey);
+}
+
+function getPerformancePriceForSymbol(symbol, dateKey) {
+  const normalized = normalizeSymbol(symbol);
+  if (dateKey >= toIsoDate(new Date())) {
+    const holding = getHoldingForAnalysis(normalized);
+    const livePrice = Number(holding.price) || 0;
+    if (livePrice > 0) return livePrice;
+  }
+
+  return getHistoricalPriceForSymbol(normalized, dateKey);
+}
+
+function getPerformanceCurrencyForSymbol(symbol, fallbackCurrency, dateKey) {
+  const normalized = normalizeSymbol(symbol);
+  const holding = getHoldingForAnalysis(normalized);
+  if (dateKey >= toIsoDate(new Date()) && holding.currency) {
+    return normalizeCurrency(holding.currency);
+  }
+
+  return normalizeCurrency(state.performancePriceSeries[normalized]?.currency || fallbackCurrency || holding.currency || BASE_CURRENCY);
 }
 
 function getHistoricalPriceForSymbol(symbol, dateKey) {
