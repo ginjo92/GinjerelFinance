@@ -4,6 +4,9 @@ const NEWS_SENTIMENT_REFRESH_MS = 30 * 60 * 1000;
 const PERFORMANCE_HISTORY_MAX_DAYS = 36500;
 const TRANSACTION_PREVIEW_LIMIT = 10;
 const WATCHLIST_ACTION_LIMIT = 8;
+const MANUAL_WATCHLIST_ID = "manual-watchlist";
+const MANUAL_WATCHLIST_LIMIT = 40;
+const WATCHLIST_RESEARCH_REFRESH_MS = 45 * 60 * 1000;
 
 const platformDefinitions = [
   { name: "Trade Republic", slug: "traderepublic", color: "00A58E", initials: "TR" },
@@ -29,7 +32,28 @@ const companyNameOverrides = {
   AAPL: "Apple Inc.",
   APPL: "Apple Inc.",
   ALB: "Albemarle Corporation",
+  BTC: "Bitcoin",
+  "BTC-USD": "Bitcoin",
+  "BTC-EUR": "Bitcoin",
+  ETH: "Ethereum",
+  "ETH-USD": "Ethereum",
+  "ETH-EUR": "Ethereum",
+  HBAR: "Hedera",
+  "HBAR-USD": "Hedera",
+  "HBAR-EUR": "Hedera",
+  LDOS: "Leidos Holdings, Inc.",
+  LU1900066033: "Amundi MSCI Semiconductors UCITS ETF Acc",
+  MU: "Micron Technology, Inc.",
+  NVDA: "NVIDIA Corporation",
+  NVO: "Novo Nordisk A/S",
+  PANW: "Palo Alto Networks, Inc.",
+  QS: "QuantumScape Corporation",
+  SMR: "NuScale Power Corporation",
   TE: "T1 Energy Inc.",
+  TTWO: "Take-Two Interactive Software, Inc.",
+  WDC: "Western Digital Corporation",
+  "WDC.DE": "Western Digital Corporation",
+  "2B76": "iShares Automation & Robotics UCITS ETF",
   RGTI: "Rigetti Computing, Inc.",
   IONQ: "IonQ, Inc.",
   QBTS: "D-Wave Quantum Inc.",
@@ -37,6 +61,22 @@ const companyNameOverrides = {
   IBM: "International Business Machines Corporation",
   MSFT: "Microsoft Corporation",
   GOOGL: "Alphabet Inc.",
+};
+const cryptoAssetNames = {
+  BTC: "Bitcoin",
+  ETH: "Ethereum",
+  SOL: "Solana",
+  DOGE: "Dogecoin",
+  XRP: "XRP",
+  ADA: "Cardano",
+  BNB: "BNB",
+  AVAX: "Avalanche",
+  DOT: "Polkadot",
+  LINK: "Chainlink",
+  LTC: "Litecoin",
+  BCH: "Bitcoin Cash",
+  SUI: "Sui",
+  HBAR: "Hedera",
 };
 const companyLogoSymbolOverrides = {
   APPL: "AAPL",
@@ -55,6 +95,16 @@ const benchmarkDefinitions = [
   { id: "world", name: "Global equities", symbol: "VT", sourceSymbol: "vt.us", currency: "USD", color: "#7c3aed" },
   { id: "europe", name: "Europe equities", symbol: "VGK", sourceSymbol: "vgk.us", currency: "USD", color: "#be185d" },
   { id: "bonds", name: "Core bonds", symbol: "BND", sourceSymbol: "bnd.us", currency: "USD", color: "#64748b" },
+];
+const performanceRangeOptions = [
+  { id: "1D", label: "Day", days: 1 },
+  { id: "1M", label: "1M", days: 31 },
+  { id: "3M", label: "3M", days: 93 },
+  { id: "6M", label: "6M", days: 186 },
+  { id: "1Y", label: "1Y", days: 366 },
+  { id: "YTD", label: "YTD" },
+  { id: "5Y", label: "5Y", days: 365 * 5 },
+  { id: "ALL", label: "All" },
 ];
 
 const defaultFx = {
@@ -210,6 +260,7 @@ const state = {
   importMode: "replace",
   search: "",
   transactionSearch: "",
+  transactionNamesDirty: false,
   transactionsExpanded: false,
   editingTransactionId: null,
   selectedTransactionIds: new Set(),
@@ -219,6 +270,7 @@ const state = {
   transactions: loadTransactions(),
   fx: loadFx(),
   activeBenchmarks: ["sp500", "nasdaq", "world"],
+  performanceRange: "ALL",
   benchmarkSeries: loadBenchmarkSeries(),
   stockAnalysis: loadStockAnalysisCache(),
   newsSentiment: loadNewsSentimentCache(),
@@ -238,6 +290,9 @@ const state = {
   remoteDbMessage: "",
   newsSentimentLoading: false,
   newsSentimentMessage: "",
+  watchlistRefreshing: false,
+  watchlistMessage: "",
+  watchlistTone: "",
   refreshDetail: "",
   performanceHoverX: null,
   donutHover: { typeDistributionChart: null, weightDistributionChart: null, sectorDistributionChart: null },
@@ -285,15 +340,20 @@ document.addEventListener("DOMContentLoaded", () => {
   initializeRemotePortfolioDb();
   refreshMarketData({ quiet: true });
   refreshNewsSentiment({ quiet: true });
+  refreshWatchlistResearchData(getAllWatchlistSymbols(), { quiet: true });
   window.setInterval(() => refreshMarketData({ quiet: true }), MARKET_REFRESH_MS);
+  window.setInterval(() => refreshWatchlistResearchData(getAllWatchlistSymbols(), { quiet: true }), WATCHLIST_RESEARCH_REFRESH_MS);
   window.addEventListener("resize", debounce(renderCharts, 120));
 });
 
 function wireControls() {
-  document.getElementById("holdingSearch").addEventListener("input", (event) => {
-    state.search = event.target.value.trim().toLowerCase();
-    renderHoldings();
-  });
+  const holdingSearch = document.getElementById("holdingSearch");
+  if (holdingSearch) {
+    holdingSearch.addEventListener("input", (event) => {
+      state.search = event.target.value.trim().toLowerCase();
+      renderHoldings();
+    });
+  }
 
   document.getElementById("transactionSymbolFilter").addEventListener("input", (event) => {
     state.transactionSearch = event.target.value.trim().toLowerCase();
@@ -392,6 +452,16 @@ function wireControls() {
     renderBenchmarkControls();
     renderPerformanceChart();
     if (!wasActive && !benchmarkSeriesCoversPerformanceWindow(state.benchmarkSeries[id])) refreshBenchmarkOnDemand(id);
+  });
+
+  document.getElementById("performanceRangeControls").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-performance-range]");
+    if (!button) return;
+    state.performanceRange = button.dataset.performanceRange;
+    state.performanceHoverX = null;
+    renderPerformanceRangeControls();
+    renderPerformanceRangeLabel();
+    renderPerformanceChart();
   });
 
   document.getElementById("assetFilters").addEventListener("click", (event) => {
@@ -822,6 +892,7 @@ function render() {
   renderPortfolioProfiles();
   renderSummary();
   renderFilters();
+  renderPerformanceRangeControls();
   renderPerformanceRangeLabel();
   renderBenchmarkControls();
   renderFormOptions();
@@ -926,6 +997,7 @@ async function switchPortfolioProfile(profileId) {
   render();
   refreshMarketData({ quiet: true });
   refreshNewsSentiment({ quiet: true });
+  refreshWatchlistResearchData(getAllWatchlistSymbols(), { quiet: true });
 }
 
 function reloadActivePortfolioProfileData() {
@@ -945,6 +1017,9 @@ function reloadActivePortfolioProfileData() {
   state.selectedTransactionIds = new Set();
   state.transactionsExpanded = false;
   state.transactionSearch = "";
+  state.transactionNamesDirty = false;
+  state.watchlistMessage = "";
+  state.watchlistTone = "";
   rebuildSavedPortfolioFromTransactions();
   ensureTickersForHoldings();
   performanceData = buildPerformanceData();
@@ -1050,15 +1125,29 @@ async function initializeRemotePortfolioDb() {
   } finally {
     state.remoteDbLoading = false;
     render();
+    refreshWatchlistResearchData(getAllWatchlistSymbols(), { quiet: true });
   }
 }
 
 async function loadProfileTransactionsFromDb(profileId) {
   const data = await requestDbJson(`/api/profiles/${encodeURIComponent(profileId)}/transactions`, { method: "GET" });
+  state.targets = loadTargets();
+  state.fx = loadFx();
+  state.benchmarkSeries = loadBenchmarkSeries();
+  state.stockAnalysis = loadStockAnalysisCache();
+  state.newsSentiment = loadNewsSentimentCache();
+  state.manualYahooLinks = loadManualYahooLinks();
+  state.watchlists = loadWatchlists();
+  state.stockChartSeries = {};
+  state.stockChartHoverX = null;
+  state.selectedStockSymbol = "";
+  state.watchlistMessage = "";
+  state.watchlistTone = "";
   state.transactions = Array.isArray(data.transactions) ? data.transactions.map(normalizeStoredTransaction).sort(compareTransactionsDesc) : [];
   saveTransactions({ skipRemoteSync: true });
   const rebuilt = rebuildPortfolioFromTransactions(state.transactions);
   state.transactions = rebuilt.transactions.sort(compareTransactionsDesc);
+  state.transactionNamesDirty = false;
   saveTransactions({ skipRemoteSync: true });
   saveHoldings();
   saveTickers();
@@ -1130,8 +1219,10 @@ function renderMarketStatus() {
   const message = state.newsSentimentLoading && state.newsSentimentMessage
     ? state.newsSentimentMessage
     : state.marketMessage || `${prefix} | USD/EUR ${formatDecimal(usdToEur)} | EUR/USD ${formatDecimal(eurToUsd)} | ${updated}`;
-  status.classList.toggle("is-loading", loading);
-  status.innerHTML = `${loading ? `<span class="status-spinner" aria-hidden="true"></span>` : ""}<span>${escapeHtml(message)}</span>`;
+  if (status) {
+    status.classList.toggle("is-loading", loading);
+    status.innerHTML = `${loading ? `<span class="status-spinner" aria-hidden="true"></span>` : ""}<span>${escapeHtml(message)}</span>`;
+  }
   if (refreshButton) {
     refreshButton.classList.toggle("is-loading", loading);
     refreshButton.disabled = state.marketRefreshing;
@@ -1149,6 +1240,8 @@ function renderSummary() {
   );
   const unrealizedGain = totalValue - totalCost;
   const realizedGain = relatedHoldings.reduce((sum, holding) => sum + getRealizedGainEUR(holding), 0);
+  const totalGain = unrealizedGain + realizedGain;
+  const totalGainBasis = relatedHoldings.reduce((sum, holding) => sum + getLifetimeInvestedEUR(holding), 0);
   const activeLabel = state.activeFilter === "All" ? "All" : state.activeFilter;
   const portfolioTotal = getTotalValue();
   const valueWeight = portfolioTotal > 0 ? clamp(safePercent(totalValue, portfolioTotal), 0, 100) : 0;
@@ -1159,7 +1252,8 @@ function renderSummary() {
   setText("dayChange", `${formatSignedEUR(dayChange)} (${formatSignedPercent(safePercent(dayChange, totalValue))})`);
   setText("unrealizedGain", `${formatSignedEUR(unrealizedGain)} (${formatSignedPercent(safePercent(unrealizedGain, totalCost))})`);
   setText("realizedGain", formatSignedEUR(realizedGain));
-  setText("valueChange", `${formatSignedEUR(unrealizedGain + realizedGain)} total gain`);
+  setText("totalGain", `${formatSignedEUR(totalGain)} (${formatSignedPercent(safePercent(totalGain, totalGainBasis))})`);
+  setText("valueChange", `${formatSignedEUR(totalGain)} total gain`);
   setText("dayChangePct", `${formatSignedPercent(safePercent(dayChange, totalValue))} today`);
   setText("ytdReturn", "");
   setText("benchmarkReturn", "");
@@ -1169,11 +1263,12 @@ function renderSummary() {
   const bar = document.getElementById("summaryValueBar");
   if (bar) bar.style.width = `${state.activeFilter === "All" ? 100 : valueWeight}%`;
 
-  colorBySign("valueChange", unrealizedGain + realizedGain);
+  colorBySign("valueChange", totalGain);
   colorBySign("dayChange", dayChange);
   colorBySign("dayChangePct", dayChange);
   colorBySign("unrealizedGain", unrealizedGain);
   colorBySign("realizedGain", realizedGain);
+  colorBySign("totalGain", totalGain);
 }
 
 function renderFilters() {
@@ -1201,6 +1296,18 @@ function renderBenchmarkControls() {
         </button>
       `,
     )
+    .join("");
+}
+
+function renderPerformanceRangeControls() {
+  const host = document.getElementById("performanceRangeControls");
+  if (!host) return;
+  host.innerHTML = performanceRangeOptions
+    .map((option) => `
+      <button type="button" class="${option.id === state.performanceRange ? "active" : ""}" data-performance-range="${escapeAttribute(option.id)}">
+        ${escapeHtml(option.label)}
+      </button>
+    `)
     .join("");
 }
 
@@ -1239,7 +1346,8 @@ function hydrateTransactionFromTicker() {
     const { symbol } = parseTickerSearchValue(searchValue);
     if (symbol) {
       const assetClass = document.getElementById("transactionAssetClass").value || inferAssetClassFromSymbol(symbol);
-      document.getElementById("transactionCurrency").value = inferCurrencyForSymbol(symbol, document.getElementById("transactionCurrency").value, assetClass);
+      const platform = document.getElementById("transactionPlatform").value || "";
+      document.getElementById("transactionCurrency").value = inferCurrencyForSymbol(symbol, document.getElementById("transactionCurrency").value, assetClass, platform);
     }
     return;
   }
@@ -1338,10 +1446,35 @@ function wireWatchlists() {
   const section = document.getElementById("watchlist");
   if (!section) return;
 
+  const form = document.getElementById("watchlistAddForm");
+  if (form) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      addManualWatchlistTicker();
+    });
+  }
+
+  const input = document.getElementById("watchlistTickerInput");
+  if (input) {
+    input.addEventListener("input", () => setWatchlistStatus("", ""));
+  }
+
   section.addEventListener("click", (event) => {
     const removeButton = event.target.closest("[data-remove-watchlist]");
     if (removeButton) {
       removeWatchlist(removeButton.dataset.removeWatchlist);
+      return;
+    }
+
+    const removeSymbolButton = event.target.closest("[data-remove-watchlist-symbol]");
+    if (removeSymbolButton) {
+      removeWatchlistSymbol(removeSymbolButton.dataset.watchlistId, removeSymbolButton.dataset.removeWatchlistSymbol);
+      return;
+    }
+
+    const refreshButton = event.target.closest("[data-refresh-watchlist]");
+    if (refreshButton) {
+      refreshWatchlistResearchData(getAllWatchlistSymbols(), { force: true });
       return;
     }
 
@@ -1363,12 +1496,17 @@ function renderWatchlists() {
   const body = document.getElementById("watchlistBody");
   if (!section || !body) return;
 
-  section.hidden = !state.watchlists.length;
-  body.innerHTML = state.watchlists.map(renderWatchlistCard).join("");
+  section.hidden = false;
+  renderWatchlistControlsState();
+  const watchlists = state.watchlists.filter((watchlist) => Array.isArray(watchlist.items) && watchlist.items.length);
+  body.innerHTML = watchlists.length
+    ? watchlists.map(renderWatchlistCard).join("")
+    : `<div class="watchlist-empty">No watchlist tickers yet.</div>`;
 }
 
 function renderWatchlistCard(watchlist) {
   const created = formatWatchlistDate(watchlist.createdAt);
+  const isManual = watchlist.id === MANUAL_WATCHLIST_ID;
   return `
     <article class="watchlist-card">
       <div class="watchlist-card-header">
@@ -1377,29 +1515,392 @@ function renderWatchlistCard(watchlist) {
           <h3>${escapeHtml(watchlist.title || "Research watchlist")}</h3>
           <span>${escapeHtml(created)} | ${watchlist.items.length} tickers | Research only</span>
         </div>
-        <button class="secondary-button compact-button" type="button" data-remove-watchlist="${escapeAttribute(watchlist.id)}">Remove</button>
+        ${isManual ? "" : `<button class="secondary-button compact-button" type="button" data-remove-watchlist="${escapeAttribute(watchlist.id)}">Remove</button>`}
       </div>
-      <div class="watchlist-items">
-        ${watchlist.items.map(renderWatchlistItem).join("")}
+      <div class="table-wrap watchlist-table-wrap">
+        <table class="watchlist-table">
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th class="number">Price</th>
+              <th>PEG</th>
+              <th>Analysts</th>
+              <th>News</th>
+              <th>Sector</th>
+              <th>Volume / trend</th>
+              <th class="number">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${watchlist.items.map((item) => renderWatchlistItem(item, watchlist)).join("")}
+          </tbody>
+        </table>
       </div>
     </article>
   `;
 }
 
-function renderWatchlistItem(item) {
+function renderWatchlistItem(item, watchlist) {
   const symbol = normalizeSymbol(item.ticker || item.symbol);
-  const name = item.name && item.name !== symbol ? item.name : getSafeKnownCompanyName(symbol) || "Open analysis";
-  const details = [item.sectorTheme, item.risk].filter(Boolean).join(" | ");
+  const row = getWatchlistRowSnapshot(item);
+  const priceTone = Number(row.dayChangePct) >= 0 ? "positive" : "negative";
+  const forecastTone = Number.isFinite(row.forecast.averageChangePct)
+    ? row.forecast.averageChangePct >= 0 ? "positive" : "negative"
+    : "";
+  const news = row.news;
+  const newsHtml = news
+    ? `
+      <div class="watchlist-pills">
+        <span class="sentiment-pill ${sentimentClass(news.sentiment)}">${escapeHtml(news.sentiment)}</span>
+        <span class="risk-pill ${newsRiskClass(news.riskScore)}">${escapeHtml(news.riskLevel)} ${news.riskScore}/100</span>
+      </div>
+      <small>${news.headlines.length ? `${news.headlines.length} recent headline${news.headlines.length === 1 ? "" : "s"}` : "No recent headlines"}</small>
+    `
+    : `<span class="watchlist-muted">Not checked</span>`;
+  const analystSummary = row.forecast.hasForecast
+    ? `${row.forecast.averageLabel}${Number.isFinite(row.forecast.averageChangePct) ? ` | ${formatForecastPercent(row.forecast.averageChangePct)}` : ""}`
+    : "No target yet";
+  const analystCount = row.forecast.analystCount ? `${row.forecast.analystCount} analyst${row.forecast.analystCount === 1 ? "" : "s"}` : "No count";
+  const sectorDetail = row.industry || displayAssetClass(row.assetClass) || "--";
+  const volumeDetail = [row.averageVolumeLabel, row.rangeLabel].filter((value) => value && value !== "--").join(" | ") || "--";
   return `
-    <article class="watchlist-item">
-      <button class="watchlist-symbol" type="button" data-watchlist-symbol="${escapeAttribute(symbol)}" aria-label="Open analysis for ${escapeAttribute(symbol)}">
-        <strong>${escapeHtml(symbol)}</strong>
-        <span>${escapeHtml(name)}</span>
-      </button>
-      <p>${escapeHtml(item.reason || "Research candidate generated by Ginjerel.")}</p>
-      ${details ? `<span class="watchlist-meta">${escapeHtml(details)}</span>` : ""}
-    </article>
+    <tr>
+      <td>
+        <div class="symbol-cell">
+          ${renderCompanyLogo({ symbol, name: row.name })}
+          <button class="stock-link watchlist-symbol-link" type="button" data-watchlist-symbol="${escapeAttribute(symbol)}" aria-label="Open analysis for ${escapeAttribute(symbol)}">
+            <strong>${escapeHtml(symbol)}</strong>
+            <span>${escapeHtml(row.name)}</span>
+          </button>
+        </div>
+      </td>
+      <td class="number">
+        <strong>${escapeHtml(row.priceLabel)}</strong>
+        <small class="${priceTone}">${formatSignedPercent(row.dayChangePct)}</small>
+      </td>
+      <td>
+        <strong class="${getPegTone(row.peg)}">${escapeHtml(row.pegLabel)}</strong>
+        <small>${escapeHtml(row.pegNote)}</small>
+      </td>
+      <td>
+        <strong>${escapeHtml(row.forecast.consensus || "--")}</strong>
+        <small class="${forecastTone}">${escapeHtml(analystSummary)}</small>
+        <small>${escapeHtml(analystCount)}</small>
+      </td>
+      <td>${newsHtml}</td>
+      <td>
+        <strong>${escapeHtml(row.sector || displayAssetClass(row.assetClass))}</strong>
+        <small>${escapeHtml(sectorDetail)}</small>
+      </td>
+      <td>
+        <strong>${escapeHtml(volumeDetail)}</strong>
+        <small>${escapeHtml(row.reason)}</small>
+      </td>
+      <td class="number">
+        <button class="secondary-button compact-button" type="button" data-watchlist-symbol="${escapeAttribute(symbol)}">Open</button>
+        <button class="secondary-button compact-button" type="button" data-watchlist-id="${escapeAttribute(watchlist.id)}" data-remove-watchlist-symbol="${escapeAttribute(symbol)}">Remove</button>
+      </td>
+    </tr>
   `;
+}
+
+function renderWatchlistControlsState() {
+  const status = document.getElementById("watchlistStatus");
+  const statusText = document.getElementById("watchlistStatusText");
+  const spinner = document.getElementById("watchlistSpinner");
+  const refreshButton = document.querySelector("[data-refresh-watchlist]");
+  if (spinner) spinner.hidden = !state.watchlistRefreshing;
+  if (statusText) statusText.textContent = state.watchlistMessage || "";
+  if (status) {
+    status.classList.toggle("is-loading", state.watchlistRefreshing);
+    status.classList.toggle("error", state.watchlistTone === "error");
+    status.classList.toggle("success", state.watchlistTone === "success");
+  }
+  if (refreshButton) {
+    refreshButton.disabled = state.watchlistRefreshing || !getAllWatchlistSymbols().length;
+    refreshButton.textContent = state.watchlistRefreshing ? "Loading" : "Refresh";
+  }
+}
+
+function setWatchlistStatus(message, tone = "") {
+  state.watchlistMessage = message || "";
+  state.watchlistTone = tone || "";
+  const status = document.getElementById("watchlistStatus");
+  const statusText = document.getElementById("watchlistStatusText");
+  const spinner = document.getElementById("watchlistSpinner");
+  if (statusText) statusText.textContent = state.watchlistMessage;
+  if (spinner) spinner.hidden = !state.watchlistRefreshing;
+  if (status) {
+    status.classList.toggle("error", tone === "error");
+    status.classList.toggle("success", tone === "success");
+    status.classList.toggle("is-loading", state.watchlistRefreshing);
+  }
+}
+
+function getWatchlistRowSnapshot(item) {
+  const symbol = normalizeSymbol(item.ticker || item.symbol);
+  const holding = getHoldingForAnalysis(symbol);
+  const analysis = getWatchlistAnalysis(symbol);
+  const merged = { ...item, ...holding, ...analysis, symbol };
+  const assetClass = analysis.assetClass || holding.assetClass || item.assetClass || inferAssetClassFromSymbol(symbol);
+  const currency = normalizeCurrency(analysis.currency || holding.currency || item.currency || inferCurrencyForSymbol(symbol, "", assetClass));
+  const price = firstForecastNumber(analysis.regularMarketPrice, analysis.price, holding.price, item.price);
+  const dayChangePct = Number(analysis.dayChangePct ?? analysis.regularMarketChangePercent ?? holding.dayChangePct ?? item.dayChangePct) || 0;
+  const name = getWatchlistDisplayName(symbol, item, holding, analysis);
+  const forecast = buildAnalystForecast(symbol, { ...holding, assetClass, currency, price }, { ...merged, name, currency, price });
+  const peg = getWatchlistPegValue(merged);
+  const averageVolume = firstForecastNumber(analysis.averageDailyVolume3Month, analysis.averageDailyVolume10Day, holding.averageDailyVolume3Month, holding.averageDailyVolume10Day);
+  const sector = getCryptoAssetSymbol(symbol, assetClass) ? "Crypto" : String(analysis.sector || item.sectorTheme || displayAssetClass(assetClass) || "").trim();
+  const industry = String(analysis.industry || "").trim();
+  const rangeLabel = getFiftyTwoWeekRangeLabel(merged, price);
+  const note = getWatchlistNote(item, analysis);
+
+  return {
+    symbol,
+    name,
+    assetClass,
+    currency,
+    price,
+    priceLabel: Number.isFinite(price) && price > 0 ? formatMoney(price, currency) : "--",
+    dayChangePct,
+    forecast,
+    peg,
+    pegLabel: Number.isFinite(peg) ? Number(peg).toFixed(2) : "--",
+    pegNote: getPegNote(peg),
+    news: getNewsSentimentForSymbol(symbol),
+    sector,
+    industry,
+    averageVolumeLabel: Number.isFinite(averageVolume) && averageVolume > 0 ? `Avg vol ${formatLargeNumber(averageVolume)}` : "--",
+    rangeLabel,
+    reason: note,
+  };
+}
+
+function getWatchlistDisplayName(symbol, item = {}, holding = {}, analysis = {}) {
+  return cleanCompanyNameCandidate(symbol, analysis.name)
+    || cleanCompanyNameCandidate(symbol, holding.name)
+    || cleanCompanyNameCandidate(symbol, item.name)
+    || getSafeKnownCompanyName(symbol)
+    || getCryptoAssetName(symbol, item.assetClass)
+    || symbol;
+}
+
+function getWatchlistAnalysis(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const baseSymbol = getBaseTickerSymbol(normalized);
+  return state.stockAnalysis[normalized] || state.stockAnalysis[baseSymbol] || {};
+}
+
+function getWatchlistPegValue(data) {
+  const value = firstForecastNumber(
+    data.pegRatio,
+    data.trailingPegRatio,
+    data.forwardPegRatio,
+    data.priceEarningsToGrowthRatio,
+  );
+  return Number.isFinite(value) && value > 0 ? value : NaN;
+}
+
+function getPegNote(peg) {
+  if (!Number.isFinite(peg)) return "Unavailable";
+  if (peg < 1) return "Low PEG";
+  if (peg < 1.8) return "Balanced";
+  if (peg < 2.8) return "Rich growth";
+  return "High PEG";
+}
+
+function formatStockPegValue(data) {
+  const peg = getWatchlistPegValue(data);
+  return Number.isFinite(peg) ? `${Number(peg).toFixed(2)} | ${getPegNote(peg)}` : "--";
+}
+
+function getPegTone(peg) {
+  if (!Number.isFinite(peg)) return "watchlist-muted";
+  if (peg < 1.8) return "positive";
+  if (peg < 2.8) return "";
+  return "negative";
+}
+
+function getFiftyTwoWeekRangeLabel(data, currentPrice) {
+  const low = firstForecastNumber(data.fiftyTwoWeekLow);
+  const high = firstForecastNumber(data.fiftyTwoWeekHigh);
+  const price = firstForecastNumber(currentPrice, data.regularMarketPrice, data.price);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || !Number.isFinite(price) || high <= low) return "--";
+  return `${formatPercent(clamp(safePercent(price - low, high - low), 0, 100))} of 52w range`;
+}
+
+function getWatchlistNote(item, analysis = {}) {
+  const nextEarnings = String(analysis.nextEarningsDate || "").trim();
+  if (nextEarnings) return nextEarnings.length > 70 ? `${nextEarnings.slice(0, 67)}...` : nextEarnings;
+  const risk = String(item.risk || "").trim();
+  if (risk) return risk.length > 70 ? `${risk.slice(0, 67)}...` : risk;
+  const reason = String(item.reason || "").trim();
+  if (reason) return reason.length > 70 ? `${reason.slice(0, 67)}...` : reason;
+  return analysis.source ? `Data from ${analysis.source}` : "Research candidate";
+}
+
+function getAllWatchlistSymbols() {
+  return [...new Set(
+    state.watchlists
+      .flatMap((watchlist) => Array.isArray(watchlist.items) ? watchlist.items : [])
+      .map((item) => normalizeSymbol(item.ticker || item.symbol))
+      .filter(Boolean),
+  )];
+}
+
+function addManualWatchlistTicker() {
+  const input = document.getElementById("watchlistTickerInput");
+  const symbol = normalizeSymbol(input?.value || "");
+  try {
+    if (!symbol) throw new Error("Ticker is required.");
+    const watchlist = ensureManualWatchlist();
+    const exists = watchlist.items.some((item) => normalizeSymbol(item.ticker || item.symbol) === symbol);
+    if (exists) throw new Error(`${symbol} is already in the watchlist.`);
+
+    const item = buildManualWatchlistItem(symbol);
+    watchlist.items = [...watchlist.items, item].slice(0, MANUAL_WATCHLIST_LIMIT);
+    watchlist.updatedAt = new Date().toISOString();
+    ensureTickerForWatchlistItem(item);
+    saveWatchlists();
+    saveTickers();
+    updateTickerCount();
+    if (input) input.value = "";
+    setWatchlistStatus(`${symbol} added. Loading research...`, "");
+    renderWatchlists();
+    refreshWatchlistResearchData([symbol], { force: true });
+  } catch (error) {
+    setWatchlistStatus(error.message, "error");
+  }
+}
+
+function ensureManualWatchlist() {
+  const existing = state.watchlists.find((watchlist) => watchlist.id === MANUAL_WATCHLIST_ID);
+  if (existing) return existing;
+  const now = new Date().toISOString();
+  const watchlist = {
+    type: "watchlist",
+    id: MANUAL_WATCHLIST_ID,
+    title: "My Watchlist",
+    theme: "Manual research",
+    items: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  state.watchlists = [watchlist, ...state.watchlists].slice(0, 12);
+  return watchlist;
+}
+
+function buildManualWatchlistItem(symbol) {
+  const assetClass = inferAssetClassFromSymbol(symbol);
+  const name = getSafeKnownCompanyName(symbol) || getCryptoAssetName(symbol, assetClass) || symbol;
+  return {
+    ticker: symbol,
+    name,
+    assetClass,
+    currency: inferCurrencyForSymbol(symbol, "", assetClass),
+    sectorTheme: displayAssetClass(assetClass),
+    reason: "Manual watchlist candidate.",
+    risk: "",
+  };
+}
+
+function removeWatchlistSymbol(watchlistId, symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const watchlist = state.watchlists.find((item) => item.id === watchlistId);
+  if (!watchlist || !normalized) return;
+  watchlist.items = watchlist.items.filter((item) => normalizeSymbol(item.ticker || item.symbol) !== normalized);
+  watchlist.updatedAt = new Date().toISOString();
+  if (!watchlist.items.length && watchlist.id !== MANUAL_WATCHLIST_ID) {
+    state.watchlists = state.watchlists.filter((item) => item.id !== watchlist.id);
+  }
+  saveWatchlists();
+  setWatchlistStatus(`${normalized} removed from watchlist.`, "success");
+  renderWatchlists();
+}
+
+function isWatchlistResearchStale(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const holding = getHoldingForAnalysis(normalized);
+  const analysis = getWatchlistAnalysis(normalized);
+  const news = getNewsSentimentForSymbol(normalized);
+  const fetchedAt = Number(analysis.fetchedAt || 0);
+  const quoteTime = Date.parse(holding.quoteFetchedAt || analysis.quoteFetchedAt || "") || 0;
+  const hasPrice = firstForecastNumber(analysis.regularMarketPrice, analysis.price, holding.price);
+  return !Number.isFinite(hasPrice)
+    || !fetchedAt
+    || Date.now() - fetchedAt > 30 * 60 * 1000
+    || !quoteTime
+    || Date.now() - quoteTime > WATCHLIST_RESEARCH_REFRESH_MS
+    || !isNewsSentimentFresh(news);
+}
+
+async function refreshWatchlistResearchData(symbols, { quiet = false, force = false } = {}) {
+  const uniqueSymbols = [...new Set((symbols || []).map(normalizeSymbol).filter((symbol) => symbol && symbol !== "CASH"))];
+  if (!uniqueSymbols.length || state.watchlistRefreshing) {
+    renderWatchlistControlsState();
+    return { updated: 0, total: 0 };
+  }
+
+  const refreshSymbols = force ? uniqueSymbols : uniqueSymbols.filter(isWatchlistResearchStale);
+  if (!refreshSymbols.length) {
+    renderWatchlistControlsState();
+    return { updated: 0, total: uniqueSymbols.length };
+  }
+
+  state.watchlistRefreshing = true;
+  state.watchlistTone = "";
+  state.watchlistMessage = `Loading research for ${refreshSymbols.length} ticker${refreshSymbols.length === 1 ? "" : "s"}...`;
+  renderWatchlists();
+
+  let quoteUpdated = 0;
+  let analysisUpdated = 0;
+  let quoteError = "";
+  let analysisError = "";
+
+  try {
+    const subjects = refreshSymbols.map((symbol) => ({ ...getHoldingForAnalysis(symbol), symbol }));
+    try {
+      const quotes = await fetchLatestQuotes(subjects);
+      quotes.forEach((quote, index) => {
+        if (!quote) return;
+        applyQuote(subjects[index].symbol, quote);
+        quoteUpdated += 1;
+      });
+    } catch (error) {
+      quoteError = error.message || "Quote refresh failed";
+    }
+
+    for (const symbol of refreshSymbols) {
+      const cached = getWatchlistAnalysis(symbol);
+      if (!force && cached?.fetchedAt && Date.now() - Number(cached.fetchedAt) < 30 * 60 * 1000) continue;
+      try {
+        const analysis = await fetchStockAnalysisData(symbol, getHoldingForAnalysis(symbol), { force });
+        state.stockAnalysis[symbol] = analysis;
+        if (analysis.name) applyTickerName(symbol, analysis.name);
+        analysisUpdated += 1;
+      } catch (error) {
+        analysisError = error.message || "Analysis refresh failed";
+      }
+    }
+
+    await refreshNewsSentimentForSymbols(refreshSymbols, { quiet: true, force });
+
+    saveHoldings();
+    saveTickers();
+    saveTransactionNamesIfDirty();
+    saveStockAnalysisCache();
+    const errors = [quoteError, analysisError].filter(Boolean);
+    state.watchlistMessage = quiet && !errors.length
+      ? ""
+      : `Watchlist updated: prices ${quoteUpdated}/${refreshSymbols.length}, research ${analysisUpdated}/${refreshSymbols.length}${errors.length ? ` | ${errors[0]}` : ""}`;
+    state.watchlistTone = errors.length ? "error" : "success";
+    renderHoldings();
+    renderSummary();
+    return { updated: Math.max(quoteUpdated, analysisUpdated), total: refreshSymbols.length };
+  } finally {
+    state.watchlistRefreshing = false;
+    renderWatchlists();
+  }
 }
 
 function renderChatActions(actions, messageIndex) {
@@ -1448,6 +1949,7 @@ function handleChatActionClick(event) {
   if (!watchlist) return;
   setChatStatus(`Added ${watchlist.title} with ${watchlist.items.length} tickers.`, "success");
   render();
+  refreshWatchlistResearchData(watchlist.items.map((item) => item.ticker || item.symbol), { force: true, quiet: true });
 }
 
 function getChatAction(messageIndex, actionIndex) {
@@ -1483,8 +1985,9 @@ function completeWatchlistWithCuratedCandidates(action, sourceMessage = "") {
   };
 }
 
-function normalizeWatchlistAction(action) {
+function normalizeWatchlistAction(action, options = {}) {
   if (!action || action.type !== "watchlist") return null;
+  const limit = Number.isFinite(options.limit) ? options.limit : WATCHLIST_ACTION_LIMIT;
   const theme = formatWatchlistTheme(action.theme || extractWatchlistTheme(action.title) || "Research");
   const items = (Array.isArray(action.items) ? action.items : [])
     .map((item) => {
@@ -1504,7 +2007,7 @@ function normalizeWatchlistAction(action) {
       };
     })
     .filter(Boolean)
-    .slice(0, WATCHLIST_ACTION_LIMIT);
+    .slice(0, limit);
 
   if (!items.length) return null;
   return {
@@ -1756,7 +2259,7 @@ function getHoldingDisplayName(holding) {
 function getKnownCompanyName(symbol, holding = null) {
   const normalized = normalizeSymbol(symbol);
   const baseSymbol = getBaseTickerSymbol(normalized);
-  const override = companyNameOverrides[normalized] || companyNameOverrides[baseSymbol];
+  const override = companyNameOverrides[normalized] || companyNameOverrides[baseSymbol] || getCryptoAssetName(normalized);
   if (override) return override;
 
   const candidates = [
@@ -1823,7 +2326,13 @@ function openStockAnalysis(symbol) {
       saveHoldings();
       saveTickers();
       saveStockAnalysisCache();
-      if (analysis.name) applyTickerName(normalized, analysis.name);
+      if (analysis.name) {
+        applyTickerName(normalized, analysis.name);
+        saveHoldings();
+        saveTickers();
+        saveTransactionNamesIfDirty();
+        saveStockAnalysisCache();
+      }
       renderStockAnalysisModal(normalized, getHoldingForAnalysis(normalized), analysis, false);
       renderHoldings();
       setStatus("stockAnalysisStatus", analysis.source ? `Data from ${analysis.source}. Not financial advice.` : "Analysis updated.", "success");
@@ -1906,7 +2415,13 @@ function saveManualYahooLinkFromModal() {
       saveHoldings();
       saveTickers();
       saveStockAnalysisCache();
-      if (analysis.name) applyTickerName(symbol, analysis.name);
+      if (analysis.name) {
+        applyTickerName(symbol, analysis.name);
+        saveHoldings();
+        saveTickers();
+        saveTransactionNamesIfDirty();
+        saveStockAnalysisCache();
+      }
       renderStockAnalysisModal(symbol, getHoldingForAnalysis(symbol), analysis, false);
       renderHoldings();
       setStatus("stockAnalysisStatus", `Data from ${analysis.source}. Not financial advice.`, "success");
@@ -1973,19 +2488,20 @@ function renderStockAnalysisContent(symbol, holding, data, loading) {
     dayChangePct,
   };
   const forecast = buildAnalystForecast(symbol, holding, liveData);
-  const notes = buildStockAnalysisNotes({ holding, data: liveData, open, weight, gainPct, dayChangePct, transactionsForSymbol });
+  const portfolioSubject = hasPortfolioHistoryForAnalysis(holding, transactionsForSymbol);
+  const notes = buildStockAnalysisNotes({ holding, data: liveData, open, weight, gainPct, dayChangePct, transactionsForSymbol, portfolioSubject });
 
   return `
     <div class="stock-analysis-grid">
       <article class="analysis-card primary-analysis-card">
-        <p>Position</p>
-        <strong>${open ? eurFormatter.format(marketValue) : formatSignedEUR(gain)}</strong>
-        <span>${open ? `${formatQuantity(holding.quantity)} shares | ${formatPercent(weight)} weight` : `Closed | realized ${formatSignedEUR(gain)}`}</span>
+        <p>${portfolioSubject ? "Position" : "Watchlist"}</p>
+        <strong>${open ? eurFormatter.format(marketValue) : portfolioSubject ? formatSignedEUR(gain) : formatMoney(price, currency)}</strong>
+        <span>${open ? `${formatQuantity(holding.quantity)} shares | ${formatPercent(weight)} weight` : portfolioSubject ? `Closed | realized ${formatSignedEUR(gain)}` : `${formatSignedPercent(dayChangePct)} today`}</span>
       </article>
       <article class="analysis-card">
-        <p>Cost</p>
-        <strong>${eurFormatter.format(investedValue)}</strong>
-        <span>${formatSignedPercent(gainPct)} total return</span>
+        <p>${portfolioSubject ? "Cost" : "Research"}</p>
+        <strong>${portfolioSubject ? eurFormatter.format(investedValue) : displayAssetClass(holding.assetClass || data.assetClass || "Equity")}</strong>
+        <span>${portfolioSubject ? `${formatSignedPercent(gainPct)} total return` : "Not in portfolio yet"}</span>
       </article>
       <article class="analysis-card">
         <p>Market price</p>
@@ -2008,13 +2524,15 @@ function renderStockAnalysisContent(symbol, holding, data, loading) {
     ${renderNewsSentimentPanel(symbol)}
 
     <div class="stock-data-grid">
-      ${renderDataPoint("Name", liveData.name || getKnownCompanyName(symbol, holding) || "--")}
+      ${renderDataPoint("Name", cleanCompanyNameCandidate(symbol, liveData.name) || getKnownCompanyName(symbol, holding) || "--")}
       ${renderDataPoint("Exchange", liveData.fullExchangeName || liveData.exchange || "--")}
       ${renderDataPoint("Sector", liveData.sector || "--")}
       ${renderDataPoint("Industry", liveData.industry || "--")}
       ${renderDataPoint("Currency", currency)}
       ${renderDataPoint("Market cap", formatLargeNumber(liveData.marketCap, currency))}
-      ${renderDataPoint("P/E", formatMaybeNumber(liveData.trailingPE ?? liveData.forwardPE))}
+      ${renderDataPoint("Trailing P/E", formatMaybeNumber(liveData.trailingPE))}
+      ${renderDataPoint("Forward P/E", formatMaybeNumber(liveData.forwardPE))}
+      ${renderDataPoint("PEG", formatStockPegValue(liveData))}
       ${renderDataPoint("Analysts", liveData.analystView || "--")}
       ${renderDataPoint("Price target", liveData.priceTarget || "--")}
       ${renderDataPoint("Target range", formatTargetRange(liveData.targetLow, liveData.targetHigh))}
@@ -2083,7 +2601,11 @@ async function fetchStockHistorySeries(symbol, holding = {}) {
 async function fetchHistoricalPriceSeries(candidates, days = 760) {
   const response = await fetch(getStockHistoryEndpoint(candidates, days), { cache: "no-store" });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Stock history server returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const tried = Array.isArray(data.tried) && data.tried.length ? ` Tried: ${data.tried.slice(0, 8).join(", ")}.` : "";
+    const details = Array.isArray(data.details) && data.details.length ? ` ${data.details.slice(0, 2).join(" | ")}` : "";
+    throw new Error(`${data.error || `Stock history server returned HTTP ${response.status}`}${tried}${details}`.trim());
+  }
   return data;
 }
 
@@ -2141,7 +2663,7 @@ function renderStockPriceChartPanel(symbol, holding, data) {
           </div>
           <button class="secondary-button compact-button" type="button" data-reload-stock-chart="${escapeAttribute(normalized)}">Retry</button>
         </div>
-        <div class="stock-chart-empty">No chart is available for ${escapeHtml(normalized)} yet.</div>
+        <div class="stock-chart-empty">No chart is available for ${escapeHtml(normalized)} yet. If the ticker trades outside the US, add the Yahoo/Google/StockAnalysis source link for the exact exchange symbol and retry.</div>
       </section>
     `;
   }
@@ -2169,7 +2691,7 @@ function renderStockPriceChartPanel(symbol, holding, data) {
         <strong>${formatMoney(last.value, currency)}</strong>
         <span class="${changePct >= 0 ? "positive" : "negative"}">${formatSignedPercent(changePct)} over ${escapeHtml(state.stockChartPeriod)}</span>
       </div>
-      ${renderStockChartSvg(points, currency)}
+      ${renderStockChartSvg(points, currency, buildStockChartEvents(normalized, data))}
     </section>
   `;
 }
@@ -2181,7 +2703,7 @@ function filterStockChartPoints(points, period) {
   return filtered.length >= 2 ? filtered : points.slice(-Math.min(points.length, 160));
 }
 
-function renderStockChartSvg(points, currency) {
+function renderStockChartSvg(points, currency, events = []) {
   const width = 760;
   const height = 260;
   const padding = { top: 18, right: 58, bottom: 34, left: 58 };
@@ -2197,6 +2719,7 @@ function renderStockChartSvg(points, currency) {
   const yFor = (value) => padding.top + (yMax - value) / Math.max(0.0001, yMax - yMin) * plotHeight;
   const path = points.map((point, index) => `${index ? "L" : "M"}${xFor(index).toFixed(1)} ${yFor(point.value).toFixed(1)}`).join(" ");
   const area = `${path} L${xFor(points.length - 1).toFixed(1)} ${height - padding.bottom} L${padding.left} ${height - padding.bottom} Z`;
+  const markers = mapStockChartEventsToMarkers(points, events).slice(0, 36);
   const hoverX = Number.isFinite(state.stockChartHoverX) ? clamp(state.stockChartHoverX, padding.left, width - padding.right) : null;
   const hoverIndex = hoverX === null ? points.length - 1 : Math.round((hoverX - padding.left) / plotWidth * (points.length - 1));
   const hoverPoint = points[clamp(hoverIndex, 0, points.length - 1)];
@@ -2223,6 +2746,7 @@ function renderStockChartSvg(points, currency) {
         ${grid}
         <path class="stock-chart-area" d="${area}"></path>
         <path class="stock-chart-line" d="${path}"></path>
+        ${renderStockChartMarkers(markers, xFor, yFor, padding, height, width)}
         <line class="stock-chart-hover-line" x1="${hoverPointX.toFixed(1)}" y1="${padding.top}" x2="${hoverPointX.toFixed(1)}" y2="${height - padding.bottom}"></line>
         <circle class="stock-chart-hover-dot" cx="${hoverPointX.toFixed(1)}" cy="${hoverPointY.toFixed(1)}" r="5"></circle>
         <text class="stock-chart-axis" x="${padding.left}" y="${height - 10}">${escapeHtml(formatStockChartDate(points[0].date))}</text>
@@ -2232,6 +2756,179 @@ function renderStockChartSvg(points, currency) {
         <strong>${escapeHtml(formatMoney(hoverPoint.value, currency))}</strong>
         <span>${escapeHtml(formatStockChartDate(hoverPoint.date))}</span>
       </div>
+      ${renderStockChartMarkerLegend(markers)}
+    </div>
+  `;
+}
+
+function buildStockChartEvents(symbol, data = {}) {
+  const normalized = normalizeSymbol(symbol);
+  const events = state.transactions
+    .filter((transaction) => normalizeSymbol(transaction.symbol) === normalized && ["buy", "sell", "dividend"].includes(transaction.type))
+    .map((transaction) => buildTransactionChartEvent(transaction))
+    .filter(Boolean);
+  const earningsDate = extractStockChartEventDate(data.nextEarningsDate || data.earningsDate || "");
+  if (earningsDate) {
+    events.push({
+      kind: "earnings",
+      label: "E",
+      date: earningsDate.iso,
+      title: `${String(data.nextEarningsDate || "").startsWith("Last report") ? "Earnings report" : "Earnings"} on ${formatStockChartDate(earningsDate.iso)}`,
+      sortWeight: 4,
+    });
+  }
+  const exDividendDate = extractStockChartEventDate(data.exDividendDate || "");
+  if (exDividendDate) {
+    events.push({
+      kind: "exDividend",
+      label: "X",
+      date: exDividendDate.iso,
+      title: `Ex-dividend date ${formatStockChartDate(exDividendDate.iso)}`,
+      sortWeight: 5,
+    });
+  }
+  return events.sort((a, b) => a.date.localeCompare(b.date) || a.sortWeight - b.sortWeight);
+}
+
+function buildTransactionChartEvent(transaction) {
+  const parsedDate = parseTradeDate(transaction.sortDate || transaction.date);
+  if (!parsedDate) return null;
+  const type = transaction.type;
+  const currency = normalizeCurrency(transaction.currency || BASE_CURRENCY);
+  const quantity = Number(transaction.quantity) || 0;
+  const price = Number(transaction.price) || 0;
+  const impact = Number(transaction.cashImpactEUR) || toEUR(getCashImpact(type, quantity, price, Number(transaction.fees) || 0), currency);
+  const labels = {
+    buy: "B",
+    sell: "S",
+    dividend: "D",
+  };
+  const titleParts = type === "dividend"
+    ? [capitalize(type), Number.isFinite(impact) && Math.abs(impact) > 0 ? formatSignedEUR(impact) : "", `on ${formatStockChartDate(parsedDate.iso)}`].filter(Boolean)
+    : [
+        capitalize(type),
+        quantity > 0 ? `${formatQuantity(quantity)} shares` : "",
+        price > 0 ? `@ ${formatMoney(price, currency)}` : "",
+        `on ${formatStockChartDate(parsedDate.iso)}`,
+      ].filter(Boolean);
+
+  return {
+    kind: type,
+    label: labels[type] || "T",
+    date: parsedDate.iso,
+    title: titleParts.join(" "),
+    sortWeight: type === "buy" ? 1 : type === "sell" ? 2 : 3,
+  };
+}
+
+function extractStockChartEventDate(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "--") return null;
+  const direct = parseTradeDate(raw);
+  if (direct) return direct;
+
+  const datePatterns = [
+    /\b(\d{4}-\d{2}-\d{2})\b/,
+    /\b([A-Z][a-z]{2,8}\.?\s+\d{1,2},\s+\d{4})\b/,
+    /\b(\d{1,2}[./-]\d{1,2}[./-]\d{4})\b/,
+  ];
+  for (const pattern of datePatterns) {
+    const match = raw.match(pattern);
+    if (!match?.[1]) continue;
+    const parsed = parseTradeDate(match[1]);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function mapStockChartEventsToMarkers(points, events) {
+  if (!points.length || !events.length) return [];
+  const grouped = new Map();
+
+  events.forEach((event) => {
+    const location = findStockChartEventPoint(points, event.date);
+    if (!location) return;
+    const key = `${location.index}-${event.kind}`;
+    const group = grouped.get(key) || {
+      ...event,
+      point: location.point,
+      pointIndex: location.index,
+      events: [],
+    };
+    group.events.push(event);
+    grouped.set(key, group);
+  });
+
+  return [...grouped.values()]
+    .sort((a, b) => a.pointIndex - b.pointIndex || a.sortWeight - b.sortWeight)
+    .map((marker, index) => ({
+      ...marker,
+      label: marker.events.length > 1 ? `${marker.label}${marker.events.length}` : marker.label,
+      title: marker.events.map((event) => event.title).join(" | "),
+      stack: index % 4,
+    }));
+}
+
+function findStockChartEventPoint(points, isoDate) {
+  const eventTime = Date.parse(`${String(isoDate || "").slice(0, 10)}T00:00:00`);
+  if (!Number.isFinite(eventTime)) return null;
+  const firstTime = Date.parse(String(points[0]?.date || "").slice(0, 10));
+  const lastTime = Date.parse(String(points[points.length - 1]?.date || "").slice(0, 10));
+  if (eventTime < firstTime - 3 * 24 * 60 * 60 * 1000 || eventTime > lastTime + 3 * 24 * 60 * 60 * 1000) return null;
+
+  let bestIndex = -1;
+  let bestDistance = Infinity;
+  points.forEach((point, index) => {
+    const pointTime = Date.parse(String(point.date || "").slice(0, 10));
+    const distance = Math.abs(pointTime - eventTime);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+
+  if (bestIndex < 0 || bestDistance > 4 * 24 * 60 * 60 * 1000) return null;
+  return { index: bestIndex, point: points[bestIndex] };
+}
+
+function renderStockChartMarkers(markers, xFor, yFor, padding, height, width) {
+  if (!markers.length) return "";
+  return markers.map((marker) => {
+    const x = xFor(marker.pointIndex);
+    const y = yFor(marker.point.value);
+    const label = escapeHtml(marker.label);
+    const tagWidth = Math.max(20, marker.label.length * 8 + 12);
+    const above = y > padding.top + 58;
+    const labelY = above
+      ? Math.max(padding.top + 12, y - 18 - marker.stack * 16)
+      : Math.min(height - padding.bottom - 12, y + 22 + marker.stack * 16);
+    const rectX = clamp(x - tagWidth / 2, padding.left + 2, width - padding.right - tagWidth - 2);
+
+    return `
+      <g class="stock-chart-marker stock-chart-marker-${escapeAttribute(marker.kind)}">
+        <title>${escapeHtml(marker.title)}</title>
+        <line class="stock-chart-marker-stem" x1="${x.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x.toFixed(1)}" y2="${labelY.toFixed(1)}"></line>
+        <circle class="stock-chart-marker-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle>
+        <rect class="stock-chart-marker-label-bg" x="${rectX.toFixed(1)}" y="${(labelY - 9).toFixed(1)}" width="${tagWidth.toFixed(1)}" height="18" rx="5"></rect>
+        <text class="stock-chart-marker-label" x="${(rectX + tagWidth / 2).toFixed(1)}" y="${(labelY + 4).toFixed(1)}">${label}</text>
+      </g>
+    `;
+  }).join("");
+}
+
+function renderStockChartMarkerLegend(markers) {
+  if (!markers.length) return "";
+  const labels = {
+    buy: "Buy",
+    sell: "Sell",
+    dividend: "Dividend",
+    earnings: "Earnings",
+    exDividend: "Ex-dividend",
+  };
+  const kinds = [...new Set(markers.map((marker) => marker.kind))];
+  return `
+    <div class="stock-chart-marker-legend" aria-label="Chart marker legend">
+      ${kinds.map((kind) => `<span class="stock-chart-marker-legend-item stock-chart-marker-${escapeAttribute(kind)}"><i></i>${escapeHtml(labels[kind] || kind)}</span>`).join("")}
     </div>
   `;
 }
@@ -2369,7 +3066,6 @@ function renderAnalystForecastPanel(symbol, holding, data) {
         ${renderForecastTable(forecast)}
       </div>
     </section>
-    ${renderRecommendationTrendPanel(forecast)}
   `;
 }
 
@@ -2857,40 +3553,6 @@ function renderForecastTable(forecast) {
   `;
 }
 
-function renderRecommendationTrendPanel(forecast) {
-  const trend = forecast.trend;
-  const ratingText = forecast.consensus
-    ? `The average analyst rating for ${forecast.companyName} is "${forecast.consensus}".`
-    : `Analyst rating data for ${forecast.companyName} is limited.`;
-  const meaning = forecast.averageChangePct >= 0
-    ? "Analysts currently expect upside versus the latest market price."
-    : "Analysts currently expect downside versus the latest market price.";
-
-  return `
-    <section class="ratings-forecast-card">
-      <div class="ratings-copy">
-        <h4>Analyst Ratings</h4>
-        <p>${escapeHtml(`${ratingText} ${Number.isFinite(forecast.averageChangePct) ? meaning : "Use the target table above as the main prediction."}`)}</p>
-      </div>
-      <div class="ratings-trends">
-        <h4>Recommendation Trends</h4>
-        ${trend?.labels?.length ? renderRecommendationBars(trend) : `<p class="modal-note">No monthly recommendation trend was found for this ticker yet.</p>`}
-      </div>
-    </section>
-  `;
-}
-
-function renderRecommendationBars(trend) {
-  const rows = Array.isArray(trend.rows) ? trend.rows : [];
-  return `
-    <table class="recommendation-table">
-      <thead><tr><th>Rating</th>${trend.labels.map((label) => `<th>${escapeHtml(label)}</th>`).join("")}</tr></thead>
-      <tbody>
-        ${rows.filter((row) => row.rating !== "Total").map((row) => `<tr><th>${escapeHtml(row.rating)}</th>${row.values.map((value) => `<td>${Number(value) || 0}</td>`).join("")}</tr>`).join("")}
-      </tbody>
-    </table>
-  `;
-}
 function renderDataPoint(label, value) {
   return `<div class="stock-data-point"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value || "--")}</strong></div>`;
 }
@@ -2899,11 +3561,16 @@ function formatTargetRange(low, high) {
   return low || high ? `${low || "--"} - ${high || "--"}` : "--";
 }
 
-function buildStockAnalysisNotes({ holding, data, open, weight, gainPct, dayChangePct, transactionsForSymbol }) {
+function buildStockAnalysisNotes({ holding, data, open, weight, gainPct, dayChangePct, transactionsForSymbol, portfolioSubject }) {
   const notes = [];
-  const name = data.name || getKnownCompanyName(holding.symbol, holding) || holding.symbol;
-  const status = open ? "open" : "closed";
-  notes.push(`${name} is an ${status} ${displayAssetClass(holding.assetClass || data.assetClass || "Equity").toLowerCase()} position in your portfolio.`);
+  const name = cleanCompanyNameCandidate(holding.symbol, data.name) || getKnownCompanyName(holding.symbol, holding) || holding.symbol;
+  const hasPortfolioSubject = portfolioSubject ?? hasPortfolioHistoryForAnalysis(holding, transactionsForSymbol);
+  if (hasPortfolioSubject) {
+    const status = open ? "open" : "closed";
+    notes.push(`${name} is an ${status} ${displayAssetClass(holding.assetClass || data.assetClass || "Equity").toLowerCase()} position in your portfolio.`);
+  } else {
+    notes.push(`${name} is a watchlist ticker, so this page focuses on valuation, analysts, news, sector, and liquidity before it becomes a portfolio position.`);
+  }
 
   if (open && weight >= 15) notes.push(`This is a large position at ${formatPercent(weight)} of the portfolio, so single-stock risk matters here.`);
   if (open && weight > 0 && weight < 3) notes.push(`This is a small position at ${formatPercent(weight)} of the portfolio, so it has limited impact on overall performance.`);
@@ -2920,16 +3587,25 @@ function buildStockAnalysisNotes({ holding, data, open, weight, gainPct, dayChan
   return notes;
 }
 
+function hasPortfolioHistoryForAnalysis(holding, transactionsForSymbol = []) {
+  return isHoldingOpen(holding)
+    || transactionsForSymbol.length > 0
+    || Math.abs(getLifetimeInvestedEUR(holding)) > 0.0000001
+    || Math.abs(getRealizedGainEUR(holding)) > 0.0000001;
+}
+
 async function fetchStockAnalysisData(symbol, holding, options = {}) {
   const normalized = normalizeSymbol(symbol);
   const cached = state.stockAnalysis[normalized];
   if (!options.force && cached && Date.now() - Number(cached.fetchedAt || 0) < 30 * 60 * 1000) return cached;
 
+  const cryptoAssetSymbol = getCryptoAssetSymbol(normalized, holding.assetClass);
+  const knownCryptoName = getCryptoAssetName(normalized);
   const quote = await fetchStooqAnalysisQuote(normalized, holding);
-  const publicData = await fetchPublicStockPages(normalized, holding).catch(() => ({}));
-  const yahooFallback = Object.keys(publicData).length ? {} : await fetchYahooQuoteData(normalized, holding).catch(() => ({}));
+  const publicData = cryptoAssetSymbol ? {} : await fetchPublicStockPages(normalized, holding).catch(() => ({}));
+  const yahooFallback = cryptoAssetSymbol ? {} : await fetchYahooQuoteData(normalized, holding).catch(() => ({}));
   const merged = { ...yahooFallback, ...publicData, ...quote };
-  const rawName = publicData.name || quote.name || yahooFallback.name || getKnownCompanyName(normalized, holding) || await fetchTickerNameFromPublicPages(normalized, holding);
+  const rawName = knownCryptoName || publicData.name || quote.name || yahooFallback.name || getKnownCompanyName(normalized, holding) || await fetchTickerNameFromPublicPages(normalized, holding);
   const name = cleanCompanyNameCandidate(normalized, rawName);
 
   return {
@@ -3025,6 +3701,12 @@ function buildStockAnalysisTargets(sourceSymbol) {
       kind: "profile",
       sourceSymbol: base,
     },
+    {
+      provider: "StockAnalysis",
+      url: `http://stockanalysis.com/stocks/${encodeURIComponent(base.toLowerCase())}/statistics/`,
+      kind: "statistics",
+      sourceSymbol: base,
+    },
   ];
 }
 function buildMarketBeatTargets(sourceSymbol) {
@@ -3114,11 +3796,13 @@ function parsePublicStockText(text, target) {
     sector: stockAnalysisData.sector || googleData.sector,
     industry: stockAnalysisData.industry || googleData.industry,
     description: stockAnalysisData.description || googleData.description,
+    pegRatio: stockAnalysisData.pegRatio || googleData.pegRatio || parseNumber(extractFirstMatch(compact, [/PEG\s+(?:Ratio|ratio)\s*[:\-]?\s*([0-9.]+)/i, /Price\/Earnings\s+to\s+Growth\s*[:\-]?\s*([0-9.]+)/i])),
     nextEarningsDate: stockAnalysisData.nextEarningsDate || extractDateNearLabel(compact, ["Earnings Date", "Next Earnings", "Estimated Earnings Date", "Earnings Announcement"]) || googleData.nextEarningsDate,
     exDividendDate: extractDateNearLabel(compact, ["Ex-Dividend Date", "Ex Dividend Date", "Ex-Date", "Ex dividend date"]) || googleData.exDividendDate,
     nextDividendDate: extractDateNearLabel(compact, ["Dividend Date", "Payment Date", "Pay Date"]),
     dividendYield: extractFirstMatch(compact, [/Dividend Yield\s*[:\-]?\s*([0-9.]+%)/i, /Dividend\s*\n\s*([0-9.]+%)/i, /Yield\s*[:\-]?\s*([0-9.]+%)/i]) || googleData.dividendYield,
     marketCap: googleData.marketCap || parseCompactNumber(extractFirstMatch(compact, [/Mkt\.\s*cap\s*\n\s*([0-9][0-9,.]*\s?[KMBT]?)/i, /Market Cap\s*[:\-]?\s*([$\u20ac\u00a3]?[0-9][0-9,.]*\s?[KMBT]?)/i])),
+    averageDailyVolume3Month: googleData.averageDailyVolume3Month || parseCompactNumber(extractFirstMatch(compact, [/Average Volume(?:\s*\([^)]*\))?\s*[:\-]?\s*([0-9][0-9,.]*\s?[KMBT]?)/i, /Avg\.\s*Vol(?:ume)?\s*[:\-]?\s*([0-9][0-9,.]*\s?[KMBT]?)/i])),
     source: target.provider,
   };
 }
@@ -3141,6 +3825,7 @@ function parseStockAnalysisCompanyText(text, target = {}) {
     sector,
     industry,
     description,
+    pegRatio: parseNumber(extractFirstMatch(compact, [/PEG\s+(?:Ratio|ratio)\s*[:\-]?\s*([0-9.]+)/i, /Price\/Earnings\s+to\s+Growth\s*[:\-]?\s*([0-9.]+)/i])),
   };
 }
 
@@ -3340,8 +4025,10 @@ function cleanCompanyNameCandidate(symbol, value) {
 
   const normalizedName = normalizeSymbol(name);
   if (normalizedName === normalized || normalizedName === baseSymbol) return "";
-  if (/^(GOOGLE FINANCE|FINANCE BETA|MARKETWATCH|MARKETWATCH\.COM|NASDAQ|YAHOO FINANCE|STOCKANALYSIS|STOCKANALYSIS\.COM|MARKETBEAT|JUST A MOMENT|ACCESS DENIED|ATTENTION REQUIRED)$/i.test(name)) return "";
-  if (/Data is currently not available/i.test(name)) return "";
+  if (/^(GOOGLE FINANCE|FINANCE BETA|MARKETWATCH|MARKETWATCH\.COM|NASDAQ|YAHOO FINANCE|STOCKANALYSIS|STOCKANALYSIS\.COM|MARKETBEAT|JUST A MOMENT|ACCESS DENIED|ATTENTION REQUIRED|NOT FOUND|NOT AVAILABLE)$/i.test(name)) return "";
+  if (/Data is currently not available|could not be found|not found/i.test(name)) return "";
+  if (/\?$/.test(name) || /^(what|how|why|when|where)\b/i.test(name)) return "";
+  if (/^(stock market today|market activity)\b/i.test(name)) return "";
 
   return name;
 }
@@ -3410,12 +4097,20 @@ function mergePublicStockData(items) {
   items.forEach((item) => {
     Object.entries(item).forEach(([key, value]) => {
       if (key === "source") return;
-      if (merged[key] === undefined || merged[key] === "" || merged[key] === 0) merged[key] = value;
+      if (isMissingMergedValue(merged[key])) merged[key] = value;
     });
     if (item.source) sources.push(item.source);
   });
   if (sources.length) merged.source = formatDataSources(sources);
   return merged;
+}
+
+function isMissingMergedValue(value) {
+  return value === undefined
+    || value === null
+    || value === ""
+    || value === 0
+    || (typeof value === "number" && !Number.isFinite(value));
 }
 
 async function fetchTickerNameFromPublicPages(symbol, holding = {}) {
@@ -3448,11 +4143,13 @@ function buildYahooQuoteSymbols(symbol, holding = {}) {
   const normalized = normalizeSymbol(symbol);
   const baseSymbol = getBaseTickerSymbol(normalized);
   const assetClass = holding.assetClass || inferAssetClassFromSymbol(normalized);
+  const cryptoSymbol = getCryptoAssetSymbol(normalized, assetClass);
   const manualYahooSymbol = getManualSourceSymbol(normalized);
   const symbols = [manualYahooSymbol, normalized, baseSymbol];
 
-  if (assetClass === "Crypto") {
-    symbols.unshift(`${baseSymbol}-EUR`, `${baseSymbol}-USD`);
+  if (assetClass === "Crypto" || cryptoSymbol) {
+    const sourceSymbol = cryptoSymbol || baseSymbol;
+    symbols.unshift(`${sourceSymbol}-EUR`, `${sourceSymbol}-USD`);
   }
   if (normalized.endsWith(".US")) symbols.unshift(baseSymbol);
   if (normalized.endsWith(".L")) symbols.unshift(normalized);
@@ -3483,6 +4180,9 @@ function normalizeYahooQuote(quote) {
     marketCap: Number(quote.marketCap) || 0,
     trailingPE: Number(quote.trailingPE) || 0,
     forwardPE: Number(quote.forwardPE) || 0,
+    pegRatio: Number(quote.pegRatio ?? quote.trailingPegRatio ?? quote.forwardPegRatio) || 0,
+    trailingPegRatio: Number(quote.trailingPegRatio) || 0,
+    forwardPegRatio: Number(quote.forwardPegRatio) || 0,
     fiftyTwoWeekLow: Number(quote.fiftyTwoWeekLow) || 0,
     fiftyTwoWeekHigh: Number(quote.fiftyTwoWeekHigh) || 0,
     averageDailyVolume3Month: Number(quote.averageDailyVolume3Month) || 0,
@@ -4094,21 +4794,26 @@ function renderDonutLegend(id, data) {
 }
 
 function getPerformanceLines() {
-  const portfolioPoints = filterPerformanceData().map((point) => ({
-    date: point.date instanceof Date ? point.date : new Date(point.date),
-    value: Number(point.portfolio) || 100,
-  }));
-  const benchmarkLines = state.activeBenchmarks
+  const rawPortfolioPoints = preparePerformanceRangePoints(
+    filterPerformanceData().map((point) => ({
+      date: point.date instanceof Date ? point.date : new Date(point.date),
+      value: Number(point.portfolio) || 100,
+    })),
+  );
+  const rawBenchmarkLines = state.activeBenchmarks
     .map((id) => benchmarkDefinitions.find((benchmark) => benchmark.id === id))
     .filter(Boolean)
     .map((benchmark) => ({
       label: benchmark.name,
       color: benchmark.color,
-      points: normalizeSeries(filterBenchmarkSeries(benchmark.id)),
+      points: preparePerformanceRangePoints(buildCashFlowAdjustedBenchmarkSeries(benchmark.id)),
     }))
     .filter((line) => line.points.length > 1);
 
-  return [{ label: "Portfolio", color: "#0f766e", points: portfolioPoints }, ...benchmarkLines];
+  return alignPerformanceLinesToRangeIntervals([
+    { label: "Portfolio", color: "#0f766e", points: rawPortfolioPoints },
+    ...rawBenchmarkLines,
+  ]);
 }
 
 function renderChartLegend(lines) {
@@ -4126,7 +4831,13 @@ function renderPerformanceRangeLabel() {
   if (!label) return;
 
   const firstDate = getFirstTransactionDate();
-  label.textContent = firstDate ? `Since ${formatMonth(new Date(`${firstDate}T00:00:00`))}` : "Since first transaction";
+  const option = getPerformanceRangeOption();
+  if (option.id === "ALL") {
+    label.textContent = firstDate ? `Since ${formatMonth(new Date(`${firstDate}T00:00:00`))}` : "Since first transaction";
+    return;
+  }
+
+  label.textContent = option.id === "YTD" ? "Year to date" : option.id === "1D" ? "Last day" : `Last ${option.label}`;
 }
 
 function renderInvestorProfile() {
@@ -4408,7 +5119,7 @@ function formatSignedWeightList(rows, maxItems) {
 }
 async function refreshMarketData({ quiet = false, refreshAnalysis = false } = {}) {
   state.marketRefreshing = true;
-  state.marketMessage = "Refreshing visible values";
+  state.marketMessage = "";
   state.refreshDetail = "Updating EUR/USD exchange rate...";
   renderVisibleRefreshOverlay();
   renderMarketStatus();
@@ -4470,6 +5181,7 @@ async function refreshMarketData({ quiet = false, refreshAnalysis = false } = {}
     saveFx();
     saveHoldings();
     saveTickers();
+    saveTransactionNamesIfDirty();
     if (refreshAnalysis) saveStockAnalysisCache();
     performanceData = buildPerformanceData();
   } catch (error) {
@@ -4570,7 +5282,7 @@ function getPerformanceHistorySubjects() {
       symbol,
       name: transaction.name || existing.name || symbol,
       assetClass: transaction.assetClass || existing.assetClass || inferAssetClassFromSymbol(symbol),
-      currency: transaction.currency || existing.currency || inferCurrencyForSymbol(symbol, "", transaction.assetClass),
+      currency: getStoredTransactionCurrency(transaction) || existing.currency || inferCurrencyForSymbol(symbol, "", transaction.assetClass, transaction.platform),
     });
   });
 
@@ -4617,6 +5329,7 @@ async function refreshTickerNames() {
     saveHoldings();
     saveTickers();
     saveTransactions();
+    state.transactionNamesDirty = false;
     renderHoldings();
   }
 
@@ -4649,16 +5362,21 @@ function shouldLookupTickerName(ticker) {
   if (!ticker?.symbol || ticker.symbol === "CASH") return false;
   const symbol = normalizeSymbol(ticker.symbol);
   const baseSymbol = getBaseTickerSymbol(symbol);
-  if (companyNameOverrides[symbol] || companyNameOverrides[baseSymbol]) return true;
-  const name = String(ticker.name || "").trim();
+  if (companyNameOverrides[symbol] || companyNameOverrides[baseSymbol] || getCryptoAssetSymbol(symbol, ticker.assetClass)) return true;
+  const name = cleanCompanyNameCandidate(symbol, ticker.name || "");
   return !name || normalizeSymbol(name) === symbol;
 }
 
 async function fetchTickerName(ticker) {
   const symbol = normalizeSymbol(ticker.symbol);
   const baseSymbol = getBaseTickerSymbol(symbol);
-  const override = companyNameOverrides[symbol] || companyNameOverrides[baseSymbol];
+  const override = companyNameOverrides[symbol] || companyNameOverrides[baseSymbol] || getCryptoAssetName(symbol);
   if (override) return override;
+
+  if (getCryptoAssetSymbol(symbol, ticker.assetClass)) {
+    const quote = await fetchLatestQuote(ticker).catch(() => null);
+    return quote?.name || "";
+  }
 
   const publicName = await fetchTickerNameFromPublicPages(symbol, ticker).catch(() => "");
   if (publicName) return publicName;
@@ -4688,7 +5406,10 @@ function applyTickerName(symbol, name) {
     if (ticker.symbol === normalized || getBaseTickerSymbol(ticker.symbol) === baseSymbol) ticker.name = cleanName;
   });
   state.transactions.forEach((transaction) => {
-    if (transaction.symbol === normalized || getBaseTickerSymbol(transaction.symbol) === baseSymbol) transaction.name = cleanName;
+    if (transaction.symbol !== normalized && getBaseTickerSymbol(transaction.symbol) !== baseSymbol) return;
+    if (transaction.name === cleanName) return;
+    transaction.name = cleanName;
+    state.transactionNamesDirty = true;
   });
   if (state.stockAnalysis[normalized]) state.stockAnalysis[normalized].name = cleanName;
 }
@@ -4815,7 +5536,7 @@ async function fetchLatestQuotes(tickers) {
 function buildQuoteRequestItem(ticker) {
   return {
     symbol: normalizeSymbol(ticker.symbol),
-    currency: normalizeCurrency(ticker.currency || inferCurrencyForSymbol(ticker.symbol, "", ticker.assetClass)),
+    currency: normalizeCurrency(ticker.currency || inferCurrencyForSymbol(ticker.symbol, "", ticker.assetClass, ticker.platform)),
     assetClass: ticker.assetClass || inferAssetClassFromSymbol(ticker.symbol),
     candidates: buildQuoteCandidates(ticker),
   };
@@ -4824,10 +5545,14 @@ function buildQuoteRequestItem(ticker) {
 function normalizeLatestQuote(item) {
   const price = Number(item?.price);
   if (!Number.isFinite(price) || price <= 0) return null;
+  const rawName = item.name || item.longName || item.shortName || "";
+  const name = cleanCompanyNameCandidate(item.symbol || "", rawName)
+    || cleanCompanyNameCandidate(item.sourceSymbol || "", rawName);
   return {
     price,
     currency: normalizeCurrency(item.currency || BASE_CURRENCY),
     dayChangePct: Number(item.dayChangePct) || 0,
+    name,
     sourceSymbol: item.sourceSymbol || "",
     source: item.source || "Local quote API",
     marketTime: item.marketTime || "",
@@ -4850,6 +5575,7 @@ async function refreshQuoteForSymbol(symbol, holding = getHoldingForAnalysis(sym
   applyQuote(normalized, quote);
   saveHoldings();
   saveTickers();
+  saveTransactionNamesIfDirty();
   saveStockAnalysisCache();
 
   if (state.selectedStockSymbol === normalized) {
@@ -4864,8 +5590,14 @@ function buildQuoteCandidates(ticker) {
   const symbol = ticker.symbol.toLowerCase();
   const raw = symbol.replace(/\s/g, "");
   const candidates = [];
+  const sourceSymbol = String(ticker.quoteSourceSymbol || ticker.sourceSymbol || "").trim().toLowerCase();
+  const sourceRaw = sourceSymbol.replace(/\s/g, "");
   const manualSymbol = getManualSourceSymbol(ticker.symbol).toLowerCase();
   const manualRaw = manualSymbol.replace(/\s/g, "");
+
+  if (sourceRaw) {
+    candidates.push({ symbol: sourceRaw, currency: inferCurrencyFromSymbol(sourceRaw, ticker.currency) });
+  }
 
   if (manualRaw) {
     candidates.push({ symbol: manualRaw, currency: inferCurrencyFromSymbol(manualRaw, ticker.currency) });
@@ -4877,7 +5609,7 @@ function buildQuoteCandidates(ticker) {
   }
 
   if (isCryptoTicker(ticker)) {
-    const cryptoSymbol = raw.replace(/[^a-z0-9]/g, "");
+    const cryptoSymbol = (getCryptoAssetSymbol(ticker.symbol, ticker.assetClass) || raw.replace(/[^a-z0-9]/g, "")).toLowerCase();
     const preferredCurrency = normalizeCurrency(ticker.currency || inferCurrencyForSymbol(ticker.symbol, "", ticker.assetClass));
     const otherCurrency = preferredCurrency === "USD" ? "EUR" : "USD";
     candidates.push({ symbol: `${cryptoSymbol}${preferredCurrency.toLowerCase()}`, currency: preferredCurrency });
@@ -4905,13 +5637,19 @@ function buildQuoteCandidates(ticker) {
 function isCryptoTicker(ticker) {
   const assetClass = String(ticker?.assetClass || "").toLowerCase();
   const symbol = normalizeSymbol(ticker?.symbol);
-  return assetClass.includes("crypto") || /^(BTC|ETH|SOL|DOGE|XRP|ADA|BNB|AVAX|DOT|LINK|LTC|BCH)$/.test(symbol);
+  return assetClass.includes("crypto") || Boolean(getCryptoAssetSymbol(symbol, ticker?.assetClass));
 }
 
 function applyQuote(symbol, quote) {
   const normalized = normalizeSymbol(symbol);
+  const cleanName = cleanCompanyNameCandidate(
+    normalized,
+    companyNameOverrides[normalized] || companyNameOverrides[getBaseTickerSymbol(normalized)] || getCryptoAssetName(normalized) || quote.name || "",
+  );
+  if (cleanName) applyTickerName(normalized, cleanName);
   holdings.forEach((holding) => {
     if (holding.symbol !== normalized) return;
+    if (cleanName) holding.name = cleanName;
     holding.price = quote.price;
     holding.currency = quote.currency;
     holding.dayChangePct = quote.dayChangePct;
@@ -4922,6 +5660,7 @@ function applyQuote(symbol, quote) {
 
   trackedTickers.forEach((ticker) => {
     if (ticker.symbol !== normalized) return;
+    if (cleanName) ticker.name = cleanName;
     ticker.price = quote.price;
     ticker.currency = quote.currency;
     ticker.dayChangePct = quote.dayChangePct;
@@ -4936,6 +5675,7 @@ function applyQuote(symbol, quote) {
       currency: quote.currency,
       regularMarketPrice: quote.price,
       price: quote.price,
+      name: cleanName || state.stockAnalysis[normalized].name,
       regularMarketChangePercent: quote.dayChangePct,
       dayChangePct: quote.dayChangePct,
       sourceSymbol: quote.sourceSymbol || state.stockAnalysis[normalized].sourceSymbol || "",
@@ -5166,6 +5906,7 @@ function getTransactionFromForm() {
     price,
     fees,
     currency,
+    currencySource: "explicit",
     cashImpactNative,
     cashImpactEUR,
     fxRateToEUR: fxRateToEUR(currency),
@@ -5456,7 +6197,8 @@ function parseTransactionsCsvRows(rows) {
     const platform = normalizePlatform(getCsvValue(row, headers, ["platform", "broker", "account", "accountname"]) || "Other");
     const explicitCurrency = getCsvValue(row, headers, ["currency", "pricecurrency", "tradecurrency", "ccy"]);
     const assetClass = getCsvValue(row, headers, ["assetclass", "class", "category"]) || inferAssetClassFromSymbol(symbol);
-    const currency = inferCurrencyForSymbol(symbol, explicitCurrency, assetClass);
+    const currencySource = explicitCurrency ? "explicit" : "inferred";
+    const currency = inferCurrencyForSymbol(symbol, explicitCurrency, assetClass, platform);
     const quantityValue = parseNumber(getCsvValue(row, headers, ["quantity", "shares", "units", "qty"]));
     if (!type && Number.isFinite(quantityValue) && quantityValue < 0) type = "sell";
     const quantity = Math.abs(quantityValue || 0);
@@ -5508,6 +6250,7 @@ function parseTransactionsCsvRows(rows) {
       price,
       fees,
       currency,
+      currencySource,
       cashImpactNative,
       cashImpactEUR: toEUR(cashImpactNative, currency),
       fxRateToEUR: fxRateToEUR(currency),
@@ -5685,13 +6428,16 @@ function applyImportedTransactions(transactions) {
 function normalizeStoredTransaction(transaction) {
   const parsedDate = parseTradeDate(transaction.sortDate || transaction.date || new Date().toISOString().slice(0, 10)) || makeDisplayDate(new Date());
   const type = normalizeTransactionType(transaction.type);
-  const currency = normalizeCurrency(transaction.currency || inferCurrencyForSymbol(transaction.symbol, "", transaction.assetClass));
+  const symbol = normalizeSymbol(transaction.symbol || "CASH");
+  const currency = getStoredTransactionCurrency(transaction);
   const quantity = Math.abs(Number(transaction.quantity) || 0);
   const price = Math.abs(Number(transaction.price) || 0);
   const fees = Math.abs(Number(transaction.fees) || 0);
   const cashImpactNative = Number.isFinite(Number(transaction.cashImpactNative))
     ? Number(transaction.cashImpactNative)
     : getCashImpact(type, quantity, price, fees);
+  const recomputeConvertedAmounts = Number(transaction.sourceRow) > 0 && transaction.currencySource !== "explicit";
+  const cashImpactEUR = toEUR(cashImpactNative, currency);
 
   return {
     ...transaction,
@@ -5699,19 +6445,45 @@ function normalizeStoredTransaction(transaction) {
     date: parsedDate.display,
     sortDate: parsedDate.iso,
     type,
-    symbol: normalizeSymbol(transaction.symbol || "CASH"),
-    name: transaction.name || normalizeSymbol(transaction.symbol || "CASH"),
-    assetClass: transaction.assetClass || inferAssetClassFromSymbol(transaction.symbol),
+    symbol,
+    name: getCleanStoredTransactionName(symbol, transaction.name),
+    assetClass: transaction.assetClass || inferAssetClassFromSymbol(symbol),
     platform: normalizePlatform(transaction.platform || "Other"),
     quantity,
     price,
     fees,
     currency,
+    currencySource: transaction.currencySource || "inferred",
     cashImpactNative,
-    cashImpactEUR: Number.isFinite(Number(transaction.cashImpactEUR)) ? Number(transaction.cashImpactEUR) : toEUR(cashImpactNative, currency),
-    fxRateToEUR: Number.isFinite(Number(transaction.fxRateToEUR)) ? Number(transaction.fxRateToEUR) : fxRateToEUR(currency),
+    cashImpactEUR: recomputeConvertedAmounts || !Number.isFinite(Number(transaction.cashImpactEUR)) ? cashImpactEUR : Number(transaction.cashImpactEUR),
+    fxRateToEUR: recomputeConvertedAmounts || !Number.isFinite(Number(transaction.fxRateToEUR)) ? fxRateToEUR(currency) : Number(transaction.fxRateToEUR),
     createdAt: Number(transaction.createdAt) || 0,
   };
+}
+
+function getCleanStoredTransactionName(symbol, value) {
+  const normalized = normalizeSymbol(symbol || "CASH");
+  return companyNameOverrides[normalized]
+    || companyNameOverrides[getBaseTickerSymbol(normalized)]
+    || getCryptoAssetName(normalized)
+    || cleanCompanyNameCandidate(normalized, value)
+    || normalized;
+}
+
+function getStoredTransactionCurrency(transaction) {
+  if (transaction.currencySource === "explicit") return normalizeCurrency(transaction.currency || BASE_CURRENCY);
+
+  const symbol = normalizeSymbol(transaction.symbol);
+  const assetClass = transaction.assetClass || inferAssetClassFromSymbol(symbol);
+  const platform = normalizePlatform(transaction.platform || "Other");
+  const sourceRow = Number(transaction.sourceRow);
+  const importedWithoutExplicitCurrency = Number.isFinite(sourceRow) && sourceRow > 0 && transaction.currencySource !== "explicit";
+
+  if (importedWithoutExplicitCurrency) {
+    return inferCurrencyForSymbol(symbol, "", assetClass, platform);
+  }
+
+  return normalizeCurrency(transaction.currency || inferCurrencyForSymbol(symbol, "", assetClass, platform));
 }
 
 function compareTransactionsAsc(a, b) {
@@ -5824,7 +6596,7 @@ function ensureTickerForTransaction(transaction) {
       name: transaction.name || transaction.symbol,
       assetClass: transaction.assetClass || inferAssetClassFromSymbol(transaction.symbol),
       platform: normalizePlatform(transaction.platform || "Other"),
-      currency: transaction.currency || inferCurrencyForSymbol(transaction.symbol, "", transaction.assetClass),
+      currency: transaction.currency || inferCurrencyForSymbol(transaction.symbol, "", transaction.assetClass, transaction.platform),
       price: transaction.price || 0,
       dayChangePct: 0,
       risk: defaultRiskForClass(transaction.assetClass || inferAssetClassFromSymbol(transaction.symbol)),
@@ -5905,7 +6677,7 @@ function drawPerformanceHover(ctx, lines, width, height, padding, min, max, date
   const pointY = padding.top + (1 - (point.value - min) / (max - min)) * yRange;
   const returnValue = point.value - 100;
   const valueLabel = formatSignedPercent(returnValue);
-  const dateLabel = formatMonth(point.date);
+  const dateLabel = formatPerformanceAxisDate(point.date);
   const title = `Portfolio ${valueLabel}`;
 
   ctx.save();
@@ -6048,15 +6820,170 @@ function drawLine(ctx, data, key, color, width, height, padding, min, max) {
 function drawAxisLabels(ctx, dateDomain, width, height, padding) {
   ctx.fillStyle = "#65706e";
   ctx.font = "12px Inter, system-ui, sans-serif";
-  const first = new Date(dateDomain.min);
-  const last = new Date(dateDomain.max);
-  ctx.fillText(formatMonth(first), padding.left, height - 10);
-  const lastLabel = formatMonth(last);
-  ctx.fillText(lastLabel, width - padding.right - ctx.measureText(lastLabel).width, height - 10);
+  ctx.textBaseline = "alphabetic";
+  const ticks = getPerformanceAxisDates(dateDomain, width, padding);
+
+  ticks.forEach((date, index) => {
+    const x = getDatePosition(date, dateDomain, width, padding);
+    const label = formatPerformanceAxisDate(date);
+    const labelWidth = ctx.measureText(label).width;
+    const labelX = index === 0
+      ? padding.left
+      : index === ticks.length - 1
+        ? width - padding.right - labelWidth
+        : x - labelWidth / 2;
+
+    ctx.fillText(label, clamp(labelX, padding.left, width - padding.right - labelWidth), height - 10);
+  });
 }
 
 function filterPerformanceData() {
   return performanceData;
+}
+
+function preparePerformanceRangePoints(points) {
+  return filterPerformancePointsByRange(points);
+}
+
+function alignPerformanceLinesToRangeIntervals(lines) {
+  const validLines = lines
+    .map((line) => ({
+      ...line,
+      points: normalizePerformanceLinePoints(line.points),
+    }))
+    .filter((line) => line.points.length > 1);
+  const dateDomain = getLineDateDomain(validLines);
+  const intervalDates = getPerformanceIntervalDates(dateDomain);
+
+  return validLines
+    .map((line) => ({
+      ...line,
+      points: samplePerformanceLineAtDates(line.points, intervalDates),
+    }))
+    .filter((line) => line.points.length > 1);
+}
+
+function normalizePerformanceLinePoints(points) {
+  return (Array.isArray(points) ? points : [])
+    .map((point) => ({
+      date: point.date instanceof Date ? point.date : new Date(point.date),
+      value: Number(point.value ?? point.portfolio),
+    }))
+    .filter((point) => Number.isFinite(point.date.getTime()) && Number.isFinite(point.value))
+    .sort((a, b) => a.date - b.date);
+}
+
+function getPerformanceIntervalDates(dateDomain) {
+  const min = new Date(dateDomain.min);
+  const max = new Date(dateDomain.max);
+  if (!Number.isFinite(min.getTime()) || !Number.isFinite(max.getTime()) || min >= max) return [min, max].filter((date) => Number.isFinite(date.getTime()));
+
+  const option = getPerformanceRangeOption();
+  const dates = [new Date(min)];
+  const cursor = new Date(min);
+  const step = getPerformanceIntervalStep(option, min, max);
+
+  while (cursor < max) {
+    if (step.months) {
+      cursor.setMonth(cursor.getMonth() + step.months);
+    } else {
+      cursor.setDate(cursor.getDate() + step.days);
+    }
+    if (cursor < max) dates.push(new Date(cursor));
+  }
+
+  if (dates[dates.length - 1].getTime() !== max.getTime()) dates.push(new Date(max));
+  return dates;
+}
+
+function getPerformanceIntervalStep(option, startDate, endDate) {
+  const totalDays = Math.max(1, Math.ceil((endDate - startDate) / (24 * 60 * 60 * 1000)));
+  if (option.id === "1D") return { days: 1 };
+  if (option.id === "1M") return { days: 1 };
+  if (option.id === "3M") return { days: 7 };
+  if (option.id === "6M") return { days: 7 };
+  if (option.id === "1Y" || option.id === "YTD") return { months: 1 };
+  if (option.id === "5Y") return { months: 3 };
+  if (totalDays <= 45) return { days: 1 };
+  if (totalDays <= 220) return { days: 7 };
+  if (totalDays <= 730) return { months: 1 };
+  return { months: 3 };
+}
+
+function getPerformanceAxisDates(dateDomain, width, padding) {
+  const min = new Date(dateDomain.min);
+  const max = new Date(dateDomain.max);
+  if (!Number.isFinite(min.getTime()) || !Number.isFinite(max.getTime()) || min >= max) return [min].filter((date) => Number.isFinite(date.getTime()));
+
+  const availableWidth = Math.max(1, width - padding.left - padding.right);
+  const maxTicks = clamp(Math.floor(availableWidth / 88), 2, 6);
+  const option = getPerformanceRangeOption();
+  const desiredTicks = option.id === "1D" ? 2 : Math.min(maxTicks, option.id === "1M" ? 4 : 5);
+  const ticks = [];
+
+  for (let index = 0; index < desiredTicks; index += 1) {
+    const ratio = desiredTicks === 1 ? 0 : index / (desiredTicks - 1);
+    ticks.push(new Date(min.getTime() + (max.getTime() - min.getTime()) * ratio));
+  }
+
+  return ticks;
+}
+
+function formatPerformanceAxisDate(date) {
+  const option = getPerformanceRangeOption();
+  if (option.id === "1D" || option.id === "1M" || option.id === "3M") {
+    return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(date);
+  }
+  if (option.id === "6M" || option.id === "YTD") {
+    return new Intl.DateTimeFormat("en-US", { month: "short" }).format(date);
+  }
+  return formatMonth(date);
+}
+
+function samplePerformanceLineAtDates(points, dates) {
+  if (!points.length || !dates.length) return [];
+  const output = [];
+  let index = 0;
+
+  dates.forEach((date) => {
+    while (index + 1 < points.length && points[index + 1].date <= date) index += 1;
+    let source = points[index]?.date <= date ? points[index] : null;
+    if (!source) source = points.find((point) => point.date >= date) || points[0];
+    if (!source) return;
+    output.push({
+      date: new Date(date),
+      value: source.value,
+    });
+  });
+
+  return output;
+}
+
+function filterPerformancePointsByRange(points) {
+  const validPoints = normalizePerformanceLinePoints(points);
+  if (validPoints.length < 2) return validPoints;
+
+  const option = getPerformanceRangeOption();
+  if (option.id === "ALL") return validPoints;
+
+  const endDate = validPoints[validPoints.length - 1].date;
+  const startDate = getPerformanceRangeStartDate(option, endDate);
+  const filtered = validPoints.filter((point) => point.date >= startDate);
+  return filtered.length >= 2 ? filtered : validPoints.slice(-2);
+}
+
+function getPerformanceRangeOption(id = state.performanceRange) {
+  return performanceRangeOptions.find((option) => option.id === id) || performanceRangeOptions[performanceRangeOptions.length - 1];
+}
+
+function getPerformanceRangeStartDate(option, endDate) {
+  const end = new Date(endDate);
+  if (option.id === "YTD") return new Date(end.getFullYear(), 0, 1);
+
+  const start = new Date(end);
+  start.setDate(start.getDate() - Number(option.days || 0));
+  start.setHours(0, 0, 0, 0);
+  return start;
 }
 
 function filterBenchmarkSeries(id) {
@@ -6079,6 +7006,129 @@ function normalizeSeries(points) {
     date: point.date instanceof Date ? point.date : new Date(point.date),
     value: first ? (Number(point.value) / first) * 100 : 100,
   }));
+}
+
+function buildCashFlowAdjustedBenchmarkSeries(id) {
+  const source = state.benchmarkSeries[id]?.length ? state.benchmarkSeries[id] : [];
+  const pricePoints = source
+    .map((point) => ({
+      date: point.date instanceof Date ? point.date : new Date(point.date),
+      dateKey: toIsoDate(point.date instanceof Date ? point.date : new Date(point.date)),
+      value: Number(point.value) || 0,
+    }))
+    .filter((point) => Number.isFinite(point.date.getTime()) && point.value > 0)
+    .sort((a, b) => a.date - b.date);
+  if (pricePoints.length < 2) return [];
+
+  const flows = getBenchmarkComparisonCashFlows();
+  if (!flows.length) return normalizeSeries(filterBenchmarkSeries(id));
+
+  const window = getPortfolioPerformanceDateWindow();
+  const cursor = new Date(window.start);
+  cursor.setHours(0, 0, 0, 0);
+  const end = new Date(window.end);
+  end.setHours(0, 0, 0, 0);
+
+  const output = [];
+  let flowIndex = 0;
+  let units = 0;
+  let cumulativeCost = 0;
+  let realizedProceeds = 0;
+
+  while (cursor <= end) {
+    const dateKey = toIsoDate(cursor);
+    const dayFlows = [];
+    while (flowIndex < flows.length && flows[flowIndex].dateKey <= dateKey) {
+      dayFlows.push(flows[flowIndex]);
+      flowIndex += 1;
+    }
+
+    dayFlows.forEach((flow) => {
+      const tradePrice = getBenchmarkTradePrice(pricePoints, flow.dateKey);
+      if (!Number.isFinite(tradePrice) || tradePrice <= 0) return;
+
+      if (flow.type === "buy") {
+        cumulativeCost += flow.costEUR;
+        units += flow.investedEUR / tradePrice;
+      } else if (flow.type === "sell" && units > 0) {
+        const unitsToSell = Math.min(units, flow.grossEUR / tradePrice);
+        units -= unitsToSell;
+        realizedProceeds += Math.max(unitsToSell * tradePrice - flow.feesEUR, 0);
+      }
+    });
+
+    const price = getBenchmarkValuationPrice(pricePoints, dateKey);
+    if (cumulativeCost > 0 && Number.isFinite(price) && price > 0) {
+      output.push({
+        date: new Date(cursor),
+        value: ((units * price + realizedProceeds) / cumulativeCost) * 100,
+      });
+    }
+
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return output.length > 1 ? output : normalizeSeries(filterBenchmarkSeries(id));
+}
+
+function getBenchmarkComparisonCashFlows() {
+  return state.transactions
+    .map(normalizeStoredTransaction)
+    .filter((transaction) => parseTradeDate(transaction.sortDate || transaction.date))
+    .map((transaction) => {
+      const symbol = normalizeSymbol(transaction.symbol);
+      if (!symbol || symbol === "CASH") return null;
+      if (!["buy", "sell"].includes(transaction.type)) return null;
+
+      const quantity = Number(transaction.quantity) || 0;
+      const price = Number(transaction.price) || 0;
+      const fees = Number(transaction.fees) || 0;
+      const currency = normalizeCurrency(transaction.currency || BASE_CURRENCY);
+      const grossEUR = toEUR(getTransactionAmount(transaction.type, quantity, price), currency);
+      const feesEUR = toEUR(fees, currency);
+      const dateKey = getTransactionDateKey(transaction);
+      if (!dateKey || grossEUR <= 0) return null;
+
+      if (transaction.type === "buy") {
+        return {
+          type: "buy",
+          dateKey,
+          investedEUR: grossEUR,
+          costEUR: grossEUR + feesEUR,
+          grossEUR,
+          feesEUR,
+        };
+      }
+
+      return {
+        type: "sell",
+        dateKey,
+        investedEUR: 0,
+        costEUR: 0,
+        grossEUR,
+        feesEUR,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+}
+
+function getBenchmarkTradePrice(points, dateKey) {
+  return getBenchmarkValuationPrice(points, dateKey) || getBenchmarkFirstPriceOnOrAfter(points, dateKey);
+}
+
+function getBenchmarkValuationPrice(points, dateKey) {
+  let lastPrice = NaN;
+  for (const point of points) {
+    if (point.dateKey > dateKey) break;
+    lastPrice = point.value;
+  }
+  return lastPrice;
+}
+
+function getBenchmarkFirstPriceOnOrAfter(points, dateKey) {
+  const point = points.find((item) => item.dateKey >= dateKey);
+  return Number(point?.value) || NaN;
 }
 
 function getPortfolioPerformanceDateWindow() {
@@ -6114,6 +7164,9 @@ function buildPerformanceData() {
   const positions = new Map();
   const output = [];
   let transactionIndex = 0;
+  let cumulativeBuyCost = 0;
+  let cumulativeProceeds = 0;
+  let cumulativeDistributions = 0;
 
   while (cursor <= today) {
     const dateKey = toIsoDate(cursor);
@@ -6133,47 +7186,55 @@ function buildPerformanceData() {
         platform: transaction.platform,
         currency: transaction.currency,
         quantity: 0,
-        costBasisEUR: 0,
       };
       const currency = normalizeCurrency(transaction.currency || BASE_CURRENCY);
       const quantity = Number(transaction.quantity) || 0;
       const price = Number(transaction.price) || 0;
       const fees = Number(transaction.fees) || 0;
+      const amount = getTransactionAmount(transaction.type, quantity, price);
 
       if (transaction.type === "buy") {
+        cumulativeBuyCost += toEUR(amount + fees, currency);
         position.quantity += quantity;
-        position.costBasisEUR += toEUR(quantity * price + fees, currency);
         position.currency = currency;
+        position.lastTradePrice = price;
+        position.lastTradeDate = dateKey;
       } else if (transaction.type === "sell" && position.quantity > 0) {
+        cumulativeProceeds += toEUR(Math.max(amount - fees, 0), currency);
         const soldQuantity = Math.min(quantity, position.quantity);
-        const soldRatio = soldQuantity / position.quantity;
         position.quantity = Math.max(position.quantity - soldQuantity, 0);
-        position.costBasisEUR = position.quantity > 0 ? Math.max(position.costBasisEUR * (1 - soldRatio), 0) : 0;
         position.currency = currency;
+        position.lastTradePrice = price;
+        position.lastTradeDate = dateKey;
+      } else if (transaction.type === "dividend") {
+        cumulativeDistributions += toEUR(Math.max(amount - fees, 0), currency);
+      } else if (transaction.type === "fee") {
+        cumulativeDistributions -= toEUR(amount + fees, currency);
       } else if (isStockQuantityAdjustment(transaction)) {
         position.quantity += quantity;
         position.currency = currency;
+        position.lastTradePrice = price;
+        position.lastTradeDate = dateKey;
       }
 
       positions.set(key, position);
     });
 
     const openPositions = [...positions.values()].filter((position) =>
-      Math.abs(position.quantity) > 0.0000001 && position.costBasisEUR > 0,
+      Math.abs(position.quantity) > 0.0000001,
     );
-    const marketValue = openPositions.reduce((sum, position) => {
-      const price = getPerformancePriceForPosition(position, dateKey);
-      const currency = getPerformanceCurrencyForSymbol(position.symbol, position.currency, dateKey);
-      return sum + toEUR(position.quantity * price, currency);
-    }, 0);
-    const costBasis = openPositions.reduce((sum, position) => sum + position.costBasisEUR, 0);
+    const pricedPositions = openPositions
+      .map((position) => ({ ...position, ...getPerformanceValuationForPosition(position, dateKey) }))
+      .filter((position) => Number.isFinite(position.price) && position.price > 0);
+    const marketValue = pricedPositions.reduce((sum, position) => sum + toEUR(position.quantity * position.price, position.currency), 0);
 
-    if (costBasis > 0) {
+    if (cumulativeBuyCost > 0 && pricedPositions.length === openPositions.length) {
+      const portfolioValue = marketValue + cumulativeProceeds + cumulativeDistributions;
       output.push({
         date: new Date(cursor),
-        portfolio: (marketValue / costBasis) * 100,
+        portfolio: (portfolioValue / cumulativeBuyCost) * 100,
         marketValue,
-        costBasis,
+        costBasis: cumulativeBuyCost,
       });
     }
 
@@ -6184,18 +7245,52 @@ function buildPerformanceData() {
 }
 
 function alignLatestPerformancePoint(points) {
-  const totalCost = getTotalCost();
-  const totalValue = getTotalValue();
-  if (totalCost <= 0 || !points.length) return points;
+  const snapshot = getOverallPortfolioReturnSnapshot();
+  if (snapshot.costBasis <= 0 || !points.length) return points;
 
   points[points.length - 1] = {
     ...points[points.length - 1],
     date: new Date(),
-    portfolio: (totalValue / totalCost) * 100,
-    marketValue: totalValue,
-    costBasis: totalCost,
+    portfolio: (snapshot.value / snapshot.costBasis) * 100,
+    marketValue: snapshot.marketValue,
+    costBasis: snapshot.costBasis,
   };
   return points;
+}
+
+function getOverallPortfolioReturnSnapshot() {
+  const transactions = state.transactions
+    .map(normalizeStoredTransaction)
+    .filter((transaction) => parseTradeDate(transaction.sortDate || transaction.date));
+  const totals = transactions.reduce((items, transaction) => {
+    const symbol = normalizeSymbol(transaction.symbol);
+    if (!symbol || symbol === "CASH") return items;
+
+    const currency = normalizeCurrency(transaction.currency || BASE_CURRENCY);
+    const quantity = Number(transaction.quantity) || 0;
+    const price = Number(transaction.price) || 0;
+    const fees = Number(transaction.fees) || 0;
+    const amount = getTransactionAmount(transaction.type, quantity, price);
+
+    if (transaction.type === "buy") {
+      items.buyCost += toEUR(amount + fees, currency);
+    } else if (transaction.type === "sell") {
+      items.proceeds += toEUR(Math.max(amount - fees, 0), currency);
+    } else if (transaction.type === "dividend") {
+      items.distributions += toEUR(Math.max(amount - fees, 0), currency);
+    } else if (transaction.type === "fee") {
+      items.distributions -= toEUR(amount + fees, currency);
+    }
+
+    return items;
+  }, { buyCost: 0, proceeds: 0, distributions: 0 });
+  const marketValue = getTotalValue();
+
+  return {
+    marketValue,
+    costBasis: totals.buyCost,
+    value: marketValue + totals.proceeds + totals.distributions,
+  };
 }
 
 function buildFlatPerformanceData() {
@@ -6217,15 +7312,40 @@ function toIsoDate(date) {
 }
 
 function getPerformancePriceForPosition(position, dateKey) {
-  const symbol = normalizeSymbol(position.symbol);
-  if (dateKey >= toIsoDate(new Date())) return getPerformancePriceForSymbol(symbol, dateKey);
+  return getPerformanceValuationForPosition(position, dateKey).price;
+}
 
-  const series = state.performancePriceSeries[symbol]?.points || [];
-  if (!series.length && position.quantity > 0 && position.costBasisEUR > 0) {
-    return fromEUR(position.costBasisEUR, position.currency || BASE_CURRENCY) / position.quantity;
+function getPerformanceValuationForPosition(position, dateKey) {
+  const symbol = normalizeSymbol(position.symbol);
+  const tradePrice = Number(position.lastTradePrice);
+  const tradeCurrency = normalizeCurrency(position.currency || BASE_CURRENCY);
+
+  if (dateKey >= toIsoDate(new Date())) {
+    const holding = getHoldingForAnalysis(symbol);
+    const livePrice = Number(holding.price) || 0;
+    if (livePrice > 0) {
+      return {
+        price: livePrice,
+        currency: normalizeCurrency(holding.currency || position.currency || BASE_CURRENCY),
+      };
+    }
   }
 
-  return getPerformancePriceForSymbol(symbol, dateKey);
+  if (position.lastTradeDate === dateKey && tradePrice > 0) {
+    return { price: tradePrice, currency: tradeCurrency };
+  }
+
+  const historicalPrice = getHistoricalPriceForSymbol(symbol, dateKey);
+  if (Number.isFinite(historicalPrice) && historicalPrice > 0) {
+    return {
+      price: historicalPrice,
+      currency: getPerformanceCurrencyForSymbol(symbol, position.currency, dateKey),
+    };
+  }
+
+  if (tradePrice > 0) return { price: tradePrice, currency: tradeCurrency };
+
+  return { price: NaN, currency: tradeCurrency };
 }
 
 function getPerformancePriceForSymbol(symbol, dateKey) {
@@ -6252,19 +7372,17 @@ function getPerformanceCurrencyForSymbol(symbol, fallbackCurrency, dateKey) {
 function getHistoricalPriceForSymbol(symbol, dateKey) {
   const normalized = normalizeSymbol(symbol);
   const series = state.performancePriceSeries[normalized]?.points || [];
-  if (!series.length) {
-    const holding = getHoldingForAnalysis(normalized);
-    return Number(holding.price) || 0;
-  }
+  if (!series.length) return NaN;
 
   let lastPrice = 0;
+  let hasPointOnOrBeforeDate = false;
   for (const point of series) {
     const pointDate = String(point.date || "").slice(0, 10);
     if (pointDate > dateKey) break;
     lastPrice = Number(point.value) || lastPrice;
+    hasPointOnOrBeforeDate = true;
   }
-  if (lastPrice > 0) return lastPrice;
-  return Number(series[0]?.value) || Number(getHoldingForAnalysis(normalized).price) || 0;
+  return hasPointOnOrBeforeDate && lastPrice > 0 ? lastPrice : NaN;
 }
 
 function initializePortfolioProfiles() {
@@ -6465,7 +7583,7 @@ function normalizeStoredWatchlist(watchlist) {
     title: watchlist?.title,
     theme: watchlist?.theme,
     items: watchlist?.items,
-  });
+  }, { limit: MANUAL_WATCHLIST_LIMIT });
   if (!normalized) return null;
   return {
     ...normalized,
@@ -6489,6 +7607,12 @@ function saveTargets() {
 function saveTransactions(options = {}) {
   setProfileStorageItem(storageKeys.transactions, JSON.stringify(state.transactions));
   if (!options.skipRemoteSync) syncActiveProfileTransactionsToDb();
+}
+
+function saveTransactionNamesIfDirty() {
+  if (!state.transactionNamesDirty) return;
+  saveTransactions();
+  state.transactionNamesDirty = false;
 }
 
 function saveFx() {
@@ -6554,6 +7678,9 @@ function normalizeHolding(holding) {
     closed: Boolean(holding.closed) || (Number(holding.quantity) || 0) === 0 && symbol !== "CASH",
     closedAt: holding.closedAt || "",
     dayChangePct: Number(holding.dayChangePct) || 0,
+    quoteSource: holding.quoteSource || "",
+    quoteSourceSymbol: holding.quoteSourceSymbol || "",
+    quoteFetchedAt: holding.quoteFetchedAt || "",
     risk: Number.isFinite(Number(holding.risk)) ? clamp(Number(holding.risk), 0, 100) : defaultRiskForClass(assetClass),
   };
 }
@@ -6569,6 +7696,9 @@ function normalizeTicker(ticker) {
     currency: normalizeCurrency(ticker.currency || BASE_CURRENCY),
     price: Number(ticker.price) || 0,
     dayChangePct: Number(ticker.dayChangePct) || 0,
+    quoteSource: ticker.quoteSource || "",
+    quoteSourceSymbol: ticker.quoteSourceSymbol || "",
+    quoteFetchedAt: ticker.quoteFetchedAt || "",
     risk: Number.isFinite(Number(ticker.risk)) ? clamp(Number(ticker.risk), 0, 100) : defaultRiskForClass(assetClass),
   };
 }
@@ -6585,6 +7715,9 @@ function holdingsToTickers(sourceHoldings) {
         currency: holding.currency,
         price: holding.price,
         dayChangePct: holding.dayChangePct,
+        quoteSource: holding.quoteSource,
+        quoteSourceSymbol: holding.quoteSourceSymbol,
+        quoteFetchedAt: holding.quoteFetchedAt,
         risk: holding.risk,
       }),
     );
@@ -6785,7 +7918,7 @@ function buildTickerFromTransactionSearch() {
   if (!symbol) return null;
   const assetClass = document.getElementById("transactionAssetClass").value || inferAssetClassFromSymbol(symbol);
   const platform = normalizePlatform(typedPlatform || document.getElementById("transactionPlatform").value || "Other");
-  const currency = normalizeCurrency(document.getElementById("transactionCurrency").value || inferCurrencyForSymbol(symbol, "", assetClass));
+  const currency = normalizeCurrency(document.getElementById("transactionCurrency").value || inferCurrencyForSymbol(symbol, "", assetClass, platform));
 
   return normalizeTicker({
     symbol,
@@ -6894,11 +8027,36 @@ function defaultRiskForClass(assetClass) {
 
 function inferAssetClassFromSymbol(symbol) {
   const normalized = normalizeSymbol(symbol);
-  if (["BTC", "ETH", "SOL", "ADA", "DOGE"].includes(normalized.replace(/[^A-Z]/g, ""))) return "Crypto";
+  if (getCryptoAssetSymbol(normalized)) return "Crypto";
   if (normalized.includes("BND") || normalized.includes("AGG") || normalized.includes("TLT")) return "Bonds";
   if (normalized.includes("VNQ") || normalized.includes("REIT")) return "Real Estate";
   if (normalized.includes("GLD") || normalized.includes("SLV") || normalized.includes("DBC")) return "Commodities";
   return "Equity";
+}
+
+function getCryptoAssetName(symbol, assetClass = "") {
+  const assetSymbol = getCryptoAssetSymbol(symbol, assetClass);
+  return assetSymbol ? cryptoAssetNames[assetSymbol] || "" : "";
+}
+
+function getCryptoAssetSymbol(value, assetClass = "") {
+  const normalized = normalizeSymbol(value).replace(/[ _/]/g, "-");
+  const isCryptoClass = /crypto/i.test(String(assetClass || ""));
+  if (!normalized) return "";
+
+  const separatedPair = normalized.match(/^([A-Z0-9]{2,20})[-.=](USD|EUR|USDT|USDC)$/);
+  if (separatedPair) return separatedPair[1];
+
+  const compactPair = normalized.match(/^([A-Z0-9]{2,20})(USD|EUR|USDT|USDC)$/);
+  if (compactPair && (["USDT", "USDC"].includes(compactPair[2]) || isCryptoClass || cryptoAssetNames[compactPair[1]])) return compactPair[1];
+
+  if (cryptoAssetNames[normalized]) return normalized;
+  if (isCryptoClass && /^[A-Z0-9]{2,20}$/.test(normalized)) return normalized;
+
+  const compact = normalized.replace(/[^A-Z0-9]/g, "");
+  return Object.keys(cryptoAssetNames).find((asset) =>
+    compact === asset || compact === `${asset}USD` || compact === `${asset}EUR` || compact === `${asset}USDT` || compact === `${asset}USDC`
+  ) || "";
 }
 
 function getPeriodReturn(data, key) {
@@ -7213,14 +8371,17 @@ function normalizeTransactionType(value) {
   return "";
 }
 
-function inferCurrencyForSymbol(symbol, explicitCurrency, assetClass) {
+function inferCurrencyForSymbol(symbol, explicitCurrency, assetClass, platform = "") {
   const explicit = String(explicitCurrency || "").trim().toUpperCase();
   if (supportedCurrencies.includes(explicit)) return explicit;
 
   const normalized = normalizeSymbol(symbol);
   if (assetClass === "Cash") return BASE_CURRENCY;
+  const cryptoPair = normalized.match(/[-.=](USD|EUR|USDT|USDC)$/);
+  if (cryptoPair) return cryptoPair[1] === "EUR" ? "EUR" : "USD";
   if (normalized.endsWith(".DE") || normalized.endsWith(".NL") || normalized.endsWith(".PA") || normalized.endsWith(".MI") || normalized.endsWith(".LS")) return "EUR";
   if (normalized.endsWith(".US")) return "USD";
+  if (normalizePlatform(platform) === "Trade Republic") return "EUR";
   if (/^[A-Z]{1,5}$/.test(normalized)) return "USD";
   return BASE_CURRENCY;
 }

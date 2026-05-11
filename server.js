@@ -14,11 +14,49 @@ const STOCK_HISTORY_MAX_DAYS = 36500;
 const STOCK_HISTORY_CANDIDATE_LIMIT = 12;
 const STOCK_QUOTE_ITEM_LIMIT = 40;
 const STOCK_QUOTE_CANDIDATE_LIMIT = 10;
+const CRYPTO_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
+const CRYPTO_QUOTE_TTL_MS = 45 * 1000;
+const CRYPTO_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PROFILE_ID = "main";
 const DEFAULT_PROFILE_NAME = "Main Portfolio";
+const CRYPTO_COINGECKO_IDS = {
+  ADA: "cardano",
+  AVAX: "avalanche-2",
+  BCH: "bitcoin-cash",
+  BNB: "binancecoin",
+  BTC: "bitcoin",
+  DOGE: "dogecoin",
+  DOT: "polkadot",
+  ETH: "ethereum",
+  HBAR: "hedera-hashgraph",
+  LINK: "chainlink",
+  LTC: "litecoin",
+  SOL: "solana",
+  SUI: "sui",
+  XRP: "ripple",
+};
+const CRYPTO_DISPLAY_NAMES = {
+  ADA: "Cardano",
+  AVAX: "Avalanche",
+  BCH: "Bitcoin Cash",
+  BNB: "BNB",
+  BTC: "Bitcoin",
+  DOGE: "Dogecoin",
+  DOT: "Polkadot",
+  ETH: "Ethereum",
+  HBAR: "Hedera",
+  LINK: "Chainlink",
+  LTC: "Litecoin",
+  SOL: "Solana",
+  SUI: "Sui",
+  XRP: "XRP",
+};
 
 let dbPool = null;
 let dbReadyPromise = null;
+const cryptoMetadataCache = new Map();
+const cryptoQuoteCache = new Map();
+const cryptoHistoryCache = new Map();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -273,15 +311,36 @@ async function handleProfileTransactions(req, res, rawProfileId) {
 async function handleStockHistory(req, res, requestUrl) {
   const candidates = parseStockHistoryCandidates(requestUrl);
   const days = clampNumber(Number(requestUrl.searchParams.get("days")) || STOCK_HISTORY_DAYS, 30, STOCK_HISTORY_MAX_DAYS);
+  const cryptoIntent = getExplicitCryptoItemFromHistoryCandidates(candidates);
 
   if (!candidates.length) {
     sendJson(res, 400, { error: "Missing stock history candidates." });
     return;
   }
 
-  const historyCandidates = uniqueBy(candidates.flatMap(getYahooHistoryCandidates), (candidate) => candidate.symbol).slice(0, STOCK_HISTORY_CANDIDATE_LIMIT);
   const errors = [];
-  for (const candidate of historyCandidates) {
+  try {
+    const cryptoHistory = await fetchCryptoHistoryForCandidates(candidates, days);
+    if (cryptoHistory?.points?.length >= 2) {
+      sendJson(res, 200, {
+        generatedAt: new Date().toISOString(),
+        source: cryptoHistory.source,
+        sourceSymbol: cryptoHistory.sourceSymbol,
+        currency: cryptoHistory.currency,
+        points: cryptoHistory.points,
+      });
+      return;
+    }
+  } catch (error) {
+    errors.push(`crypto: ${error.message || "failed"}`);
+  }
+
+  const historyCandidates = await expandYahooCandidates(candidates, STOCK_HISTORY_CANDIDATE_LIMIT);
+  const yahooHistoryCandidates = cryptoIntent
+    ? historyCandidates.filter((candidate) => isYahooCryptoPairSymbol(candidate.symbol))
+    : historyCandidates;
+
+  for (const candidate of yahooHistoryCandidates) {
     try {
       const series = await fetchYahooHistory(candidate.symbol, days);
       if (series.points.length >= 2) {
@@ -299,9 +358,28 @@ async function handleStockHistory(req, res, requestUrl) {
     }
   }
 
+  const stooqCandidates = cryptoIntent ? [] : expandStooqCandidates(candidates, STOCK_HISTORY_CANDIDATE_LIMIT);
+  for (const candidate of stooqCandidates) {
+    try {
+      const series = await fetchStooqHistory(candidate.symbol, days);
+      if (series.points.length >= 2) {
+        sendJson(res, 200, {
+          generatedAt: new Date().toISOString(),
+          source: "Stooq",
+          sourceSymbol: candidate.symbol,
+          currency: candidate.currency,
+          points: series.points,
+        });
+        return;
+      }
+    } catch (error) {
+      errors.push(`${candidate.symbol}: ${error.message || "failed"}`);
+    }
+  }
+
   sendJson(res, 404, {
     error: "No historical prices found.",
-    tried: historyCandidates.map((candidate) => candidate.symbol),
+    tried: [...yahooHistoryCandidates, ...stooqCandidates].map((candidate) => candidate.symbol),
     details: errors.slice(0, 3),
   });
 }
@@ -318,7 +396,7 @@ async function handleStockQuotes(req, res) {
   const quoteItems = await mapWithConcurrency(items, 6, fetchStockQuoteForItem);
   sendJson(res, 200, {
     generatedAt: new Date().toISOString(),
-    source: "Yahoo Finance",
+    source: "Mixed quote providers",
     items: quoteItems,
   });
 }
@@ -347,6 +425,7 @@ function normalizeQuoteRequestItems(items) {
       return {
         symbol,
         currency: fallbackCurrency,
+        assetClass: String(item?.assetClass || "").trim(),
         candidates: uniqueBy(normalizedCandidates, (candidate) => `${candidate.symbol}:${candidate.currency}`).slice(0, STOCK_QUOTE_CANDIDATE_LIMIT),
       };
     })
@@ -355,10 +434,33 @@ function normalizeQuoteRequestItems(items) {
 }
 
 async function fetchStockQuoteForItem(item) {
-  const quoteCandidates = uniqueBy(item.candidates.flatMap(getYahooHistoryCandidates), (candidate) => candidate.symbol).slice(0, STOCK_QUOTE_CANDIDATE_LIMIT);
   const errors = [];
+  const cryptoIntent = getCryptoItemFromQuoteItem(item);
+  try {
+    const cryptoQuote = await fetchCryptoQuoteForItem(item);
+    if (cryptoQuote?.price > 0) {
+      return {
+        symbol: item.symbol,
+        price: cryptoQuote.price,
+        currency: cryptoQuote.currency || item.currency,
+        dayChangePct: cryptoQuote.dayChangePct,
+        name: cryptoQuote.name || "",
+        source: cryptoQuote.source,
+        sourceSymbol: cryptoQuote.sourceSymbol,
+        marketTime: cryptoQuote.marketTime,
+        fetchedAt: new Date().toISOString(),
+      };
+    }
+  } catch (error) {
+      errors.push(`crypto: ${error.message || "failed"}`);
+  }
 
-  for (const candidate of quoteCandidates) {
+  const quoteCandidates = await expandYahooCandidates(item.candidates, STOCK_QUOTE_CANDIDATE_LIMIT);
+  const yahooQuoteCandidates = cryptoIntent
+    ? quoteCandidates.filter((candidate) => isYahooCryptoPairSymbol(candidate.symbol))
+    : quoteCandidates;
+
+  for (const candidate of yahooQuoteCandidates) {
     try {
       const quote = await fetchYahooQuote(candidate.symbol);
       if (quote.price > 0) {
@@ -367,7 +469,30 @@ async function fetchStockQuoteForItem(item) {
           price: quote.price,
           currency: quote.currency || candidate.currency || item.currency,
           dayChangePct: quote.dayChangePct,
+          name: quote.name || candidate.name || "",
           source: "Yahoo Finance",
+          sourceSymbol: candidate.symbol,
+          marketTime: quote.marketTime,
+          fetchedAt: new Date().toISOString(),
+        };
+      }
+    } catch (error) {
+      errors.push(`${candidate.symbol}: ${error.message || "failed"}`);
+    }
+  }
+
+  const stooqCandidates = cryptoIntent ? [] : expandStooqCandidates(item.candidates, STOCK_QUOTE_CANDIDATE_LIMIT);
+  for (const candidate of stooqCandidates) {
+    try {
+      const quote = await fetchStooqQuote(candidate.symbol);
+      if (quote.price > 0) {
+        return {
+          symbol: item.symbol,
+          price: quote.price,
+          currency: candidate.currency || item.currency,
+          dayChangePct: quote.dayChangePct,
+          name: "",
+          source: "Stooq",
           sourceSymbol: candidate.symbol,
           marketTime: quote.marketTime,
           fetchedAt: new Date().toISOString(),
@@ -381,7 +506,7 @@ async function fetchStockQuoteForItem(item) {
   return {
     symbol: item.symbol,
     error: "No quote found.",
-    tried: quoteCandidates.map((candidate) => candidate.symbol),
+    tried: [...yahooQuoteCandidates, ...stooqCandidates].map((candidate) => candidate.symbol),
     details: errors.slice(0, 3),
   };
 }
@@ -425,13 +550,520 @@ function inferCurrencyFromHistorySymbol(symbol) {
   return "USD";
 }
 
+function parseCryptoPairSymbol(value, assetClass = "") {
+  const raw = normalizeCryptoSymbolInput(value).replace(/\.(us|de|nl|pa|mi|ls|sw|l)$/i, "");
+  const isCryptoClass = /crypto/i.test(String(assetClass || ""));
+  if (!raw) return null;
+
+  const separated = raw.match(/^([a-z0-9]{2,20})[-=](usd|eur|usdt|usdc)$/i);
+  if (separated) {
+    return {
+      assetSymbol: separated[1].toUpperCase(),
+      currency: stableQuoteToCurrency(separated[2]),
+    };
+  }
+
+  const compact = raw.match(/^([a-z0-9]{2,20})(usd|eur|usdt|usdc)$/i);
+  if (compact && (isCryptoClass || /^(usdt|usdc)$/i.test(compact[2]))) {
+    return {
+      assetSymbol: compact[1].toUpperCase(),
+      currency: stableQuoteToCurrency(compact[2]),
+    };
+  }
+
+  if (isCryptoClass && !raw.includes(".")) {
+    return {
+      assetSymbol: raw.toUpperCase(),
+      currency: "USD",
+    };
+  }
+
+  return null;
+}
+
+function parseExplicitCryptoPairSymbol(value) {
+  const parsed = parseCryptoPairSymbol(value);
+  if (parsed?.assetSymbol) return parsed;
+
+  const raw = normalizeCryptoSymbolInput(value);
+  if (!raw || raw.includes(".")) return null;
+  const compact = raw.match(/^([a-z0-9]{2,20})(usd|eur)$/i);
+  if (!compact) return null;
+
+  return {
+    assetSymbol: compact[1].toUpperCase(),
+    currency: stableQuoteToCurrency(compact[2]),
+  };
+}
+
+function normalizeCryptoSymbolInput(value) {
+  return String(value || "").trim().toLowerCase().replace(/[ _/]/g, "-").replace(/[^a-z0-9.=-]/g, "");
+}
+
+function stableQuoteToCurrency(value) {
+  const normalized = String(value || "").toUpperCase();
+  return normalized === "EUR" ? "EUR" : "USD";
+}
+
+function getCryptoItemFromQuoteItem(item) {
+  const values = [
+    item.symbol,
+    ...(Array.isArray(item.candidates) ? item.candidates.map((candidate) => candidate.symbol) : []),
+  ];
+  for (const value of values) {
+    const parsed = parseCryptoPairSymbol(value, item.assetClass);
+    if (!parsed?.assetSymbol) continue;
+    return {
+      assetSymbol: parsed.assetSymbol,
+      currency: parsed.currency || normalizeCurrency(item.currency || "USD"),
+    };
+  }
+  return null;
+}
+
+function getExplicitCryptoItemFromHistoryCandidates(candidates) {
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const parsed = parseExplicitCryptoPairSymbol(candidate?.symbol);
+    if (!parsed?.assetSymbol) continue;
+    return {
+      assetSymbol: parsed.assetSymbol,
+      currency: parsed.currency || normalizeCurrency(candidate?.currency || "USD"),
+    };
+  }
+  return null;
+}
+
+async function fetchCryptoQuoteForItem(item) {
+  const cryptoItem = getCryptoItemFromQuoteItem(item);
+  if (!cryptoItem) return null;
+
+  const currency = normalizeCurrency(cryptoItem.currency || item.currency || "USD");
+  const cacheKey = `${cryptoItem.assetSymbol}:${currency}`;
+  const cached = cryptoQuoteCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CRYPTO_QUOTE_TTL_MS) return cached.value;
+
+  const metadata = await fetchCryptoMetadata(cryptoItem.assetSymbol);
+  if (!metadata?.id) return null;
+
+  let quote;
+  try {
+    quote = metadata.provider === "CoinMarketCap"
+      ? await fetchCoinMarketCapQuote(metadata, currency)
+      : metadata.provider === "CoinPaprika"
+      ? await fetchCoinPaprikaQuote(metadata, currency)
+      : await fetchCoinGeckoQuote(metadata, currency);
+  } catch (error) {
+    const fallbackMetadata = metadata.provider === "CoinGecko"
+      ? await fetchCoinPaprikaMetadata(cryptoItem.assetSymbol).catch(() => null)
+      : await fetchCoinGeckoMetadata(cryptoItem.assetSymbol).catch(() => null)
+        || await fetchCoinPaprikaMetadata(cryptoItem.assetSymbol).catch(() => null);
+    if (!fallbackMetadata?.id) throw error;
+    quote = fallbackMetadata.provider === "CoinPaprika"
+      ? await fetchCoinPaprikaQuote(fallbackMetadata, currency)
+      : await fetchCoinGeckoQuote(fallbackMetadata, currency);
+  }
+
+  cryptoQuoteCache.set(cacheKey, { fetchedAt: Date.now(), value: quote });
+  return quote;
+}
+
+async function fetchCryptoHistoryForCandidates(candidates, days) {
+  const cryptoItem = getExplicitCryptoItemFromHistoryCandidates(candidates);
+  if (!cryptoItem) return null;
+
+  const currency = normalizeCurrency(cryptoItem.currency || "USD");
+  const cacheKey = `${cryptoItem.assetSymbol}:${currency}:${days}`;
+  const cached = cryptoHistoryCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CRYPTO_HISTORY_TTL_MS) return cached.value;
+
+  const metadata = await fetchCoinGeckoMetadata(cryptoItem.assetSymbol).catch(() => null);
+  if (!metadata?.id) return null;
+
+  const daysParam = days >= 3650 ? "max" : String(days);
+  const url = `${getCoinGeckoBaseUrl()}/api/v3/coins/${encodeURIComponent(metadata.id)}/market_chart?vs_currency=${currency.toLowerCase()}&days=${encodeURIComponent(daysParam)}&interval=daily`;
+  const response = await fetch(url, { headers: getCoinGeckoHeaders() });
+  if (!response.ok) throw new Error(`CoinGecko history HTTP ${response.status}`);
+
+  const data = await response.json();
+  const points = (Array.isArray(data?.prices) ? data.prices : [])
+    .map((point) => ({
+      date: new Date(Number(point?.[0])).toISOString(),
+      value: Number(point?.[1]),
+    }))
+    .filter((point) => !Number.isNaN(Date.parse(point.date)) && Number.isFinite(point.value) && point.value > 0);
+  if (points.length < 2) return null;
+
+  const value = {
+    source: "CoinGecko",
+    sourceSymbol: `${cryptoItem.assetSymbol}-${currency}`,
+    currency,
+    points,
+  };
+  cryptoHistoryCache.set(cacheKey, { fetchedAt: Date.now(), value });
+  return value;
+}
+
+async function fetchCryptoMetadata(assetSymbol) {
+  const symbol = String(assetSymbol || "").trim().toUpperCase();
+  if (!symbol) return null;
+
+  const cached = cryptoMetadataCache.get(symbol);
+  if (cached && Date.now() - cached.fetchedAt < CRYPTO_METADATA_TTL_MS) return cached.value;
+
+  let metadata = await fetchCoinMarketCapMetadata(symbol).catch(() => null);
+  if (!metadata) metadata = await fetchCoinGeckoMetadata(symbol).catch(() => null);
+  if (!metadata) metadata = await fetchCoinPaprikaMetadata(symbol).catch(() => null);
+  if (metadata) cryptoMetadataCache.set(symbol, { fetchedAt: Date.now(), value: metadata });
+  return metadata;
+}
+
+async function fetchCoinMarketCapMetadata(assetSymbol) {
+  if (!process.env.COINMARKETCAP_API_KEY) return null;
+
+  const url = `https://pro-api.coinmarketcap.com/v1/cryptocurrency/map?symbol=${encodeURIComponent(assetSymbol)}&sort=cmc_rank&aux=first_historical_data,last_historical_data,is_active,status`;
+  const response = await fetch(url, { headers: getCoinMarketCapHeaders() });
+  if (!response.ok) throw new Error(`CoinMarketCap map HTTP ${response.status}`);
+
+  const data = await response.json();
+  const coins = Array.isArray(data?.data) ? data.data : [];
+  const coin = coins
+    .filter((item) => String(item.symbol || "").toUpperCase() === assetSymbol)
+    .sort(compareCryptoSearchResults)[0];
+  if (!coin?.id) return null;
+
+  return {
+    provider: "CoinMarketCap",
+    id: String(coin.id),
+    assetSymbol,
+    symbol: String(coin.symbol || assetSymbol).toUpperCase(),
+    name: firstString(coin.name, assetSymbol),
+  };
+}
+
+async function fetchCoinGeckoMetadata(assetSymbol) {
+  const symbol = String(assetSymbol || "").trim().toUpperCase();
+  const knownId = CRYPTO_COINGECKO_IDS[symbol];
+  if (knownId) {
+    return {
+      provider: "CoinGecko",
+      id: knownId,
+      assetSymbol: symbol,
+      symbol,
+      name: CRYPTO_DISPLAY_NAMES[symbol] || symbol,
+    };
+  }
+
+  const url = `${getCoinGeckoBaseUrl()}/api/v3/search?query=${encodeURIComponent(symbol.toLowerCase())}`;
+  const response = await fetch(url, { headers: getCoinGeckoHeaders() });
+  if (!response.ok) throw new Error(`CoinGecko search HTTP ${response.status}`);
+
+  const data = await response.json();
+  const coins = Array.isArray(data?.coins) ? data.coins : [];
+  const exact = coins
+    .filter((coin) => String(coin.symbol || "").toUpperCase() === symbol)
+    .sort(compareCryptoSearchResults);
+  const coin = exact[0];
+  if (!coin?.id) return null;
+
+  return {
+    provider: "CoinGecko",
+    id: String(coin.id),
+    assetSymbol: symbol,
+    symbol: String(coin.symbol || symbol).toUpperCase(),
+    name: firstString(coin.name, symbol),
+  };
+}
+
+async function fetchCoinPaprikaMetadata(assetSymbol) {
+  const url = `https://api.coinpaprika.com/v1/search?q=${encodeURIComponent(assetSymbol.toLowerCase())}&c=currencies&limit=10`;
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+      "User-Agent": "Mozilla/5.0 GinjerelFinance/0.1",
+    },
+  });
+  if (!response.ok) throw new Error(`CoinPaprika search HTTP ${response.status}`);
+
+  const data = await response.json();
+  const currencies = Array.isArray(data?.currencies) ? data.currencies : [];
+  const exact = currencies
+    .filter((coin) => String(coin.symbol || "").toUpperCase() === assetSymbol)
+    .sort(compareCryptoSearchResults);
+  const coin = exact[0];
+  if (!coin?.id) return null;
+
+  return {
+    provider: "CoinPaprika",
+    id: String(coin.id),
+    assetSymbol,
+    symbol: String(coin.symbol || assetSymbol).toUpperCase(),
+    name: firstString(coin.name, assetSymbol),
+  };
+}
+
+function compareCryptoSearchResults(a, b) {
+  const aRank = Number(a.market_cap_rank || a.rank || Number.MAX_SAFE_INTEGER);
+  const bRank = Number(b.market_cap_rank || b.rank || Number.MAX_SAFE_INTEGER);
+  return aRank - bRank;
+}
+
+async function fetchCoinGeckoQuote(metadata, currency) {
+  const vsCurrency = normalizeCurrency(currency).toLowerCase();
+  const url = `${getCoinGeckoBaseUrl()}/api/v3/simple/price?ids=${encodeURIComponent(metadata.id)}&vs_currencies=${vsCurrency}&include_24hr_change=true&include_last_updated_at=true`;
+  const response = await fetch(url, { headers: getCoinGeckoHeaders() });
+  if (!response.ok) throw new Error(`CoinGecko price HTTP ${response.status}`);
+
+  const data = await response.json();
+  const quote = data?.[metadata.id] || {};
+  const price = Number(quote[vsCurrency]);
+  if (!Number.isFinite(price) || price <= 0) throw new Error(`No CoinGecko price for ${metadata.assetSymbol}`);
+
+  const updatedAt = Number(quote.last_updated_at);
+  return {
+    price,
+    currency: normalizeCurrency(currency),
+    dayChangePct: Number(quote[`${vsCurrency}_24h_change`]) || 0,
+    name: metadata.name,
+    source: "CoinGecko",
+    sourceSymbol: `${metadata.assetSymbol}-${normalizeCurrency(currency)}`,
+    marketTime: Number.isFinite(updatedAt) && updatedAt > 0 ? new Date(updatedAt * 1000).toISOString() : "",
+  };
+}
+
+async function fetchCoinMarketCapQuote(metadata, currency) {
+  if (!process.env.COINMARKETCAP_API_KEY) return null;
+
+  const normalizedCurrency = normalizeCurrency(currency);
+  const url = `https://pro-api.coinmarketcap.com/v3/cryptocurrency/quotes/latest?id=${encodeURIComponent(metadata.id)}&convert=${encodeURIComponent(normalizedCurrency)}`;
+  const response = await fetch(url, { headers: getCoinMarketCapHeaders() });
+  if (!response.ok) throw new Error(`CoinMarketCap quote HTTP ${response.status}`);
+
+  const data = await response.json();
+  const item = data?.data?.[metadata.id] || Object.values(data?.data || {})[0] || {};
+  const quote = item?.quote?.[normalizedCurrency] || item?.quotes?.[normalizedCurrency] || {};
+  const price = Number(quote.price);
+  if (!Number.isFinite(price) || price <= 0) throw new Error(`No CoinMarketCap price for ${metadata.assetSymbol}`);
+
+  return {
+    price,
+    currency: normalizedCurrency,
+    dayChangePct: Number(quote.percent_change_24h) || Number(quote.percentage_change_24h) || 0,
+    name: firstString(item.name, metadata.name),
+    source: "CoinMarketCap",
+    sourceSymbol: `${metadata.assetSymbol}-${normalizedCurrency}`,
+    marketTime: quote.last_updated ? new Date(quote.last_updated).toISOString() : "",
+  };
+}
+
+async function fetchCoinPaprikaQuote(metadata, currency) {
+  const normalizedCurrency = normalizeCurrency(currency);
+  const url = `https://api.coinpaprika.com/v1/tickers/${encodeURIComponent(metadata.id)}?quotes=${encodeURIComponent(normalizedCurrency)}`;
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+      "User-Agent": "Mozilla/5.0 GinjerelFinance/0.1",
+    },
+  });
+  if (!response.ok) throw new Error(`CoinPaprika ticker HTTP ${response.status}`);
+
+  const data = await response.json();
+  const quote = data?.quotes?.[normalizedCurrency] || {};
+  const price = Number(quote.price);
+  if (!Number.isFinite(price) || price <= 0) throw new Error(`No CoinPaprika price for ${metadata.assetSymbol}`);
+
+  return {
+    price,
+    currency: normalizedCurrency,
+    dayChangePct: Number(quote.percent_change_24h) || 0,
+    name: metadata.name,
+    source: "CoinPaprika",
+    sourceSymbol: `${metadata.assetSymbol}-${normalizedCurrency}`,
+    marketTime: data.last_updated ? new Date(data.last_updated).toISOString() : "",
+  };
+}
+
+function getCoinGeckoBaseUrl() {
+  return process.env.COINGECKO_PRO_API_KEY ? "https://pro-api.coingecko.com" : "https://api.coingecko.com";
+}
+
+function getCoinGeckoHeaders() {
+  const headers = {
+    "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 GinjerelFinance/0.1",
+  };
+  if (process.env.COINGECKO_PRO_API_KEY) headers["x-cg-pro-api-key"] = process.env.COINGECKO_PRO_API_KEY;
+  if (process.env.COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
+  return headers;
+}
+
+function getCoinMarketCapHeaders() {
+  return {
+    "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 GinjerelFinance/0.1",
+    "X-CMC_PRO_API_KEY": process.env.COINMARKETCAP_API_KEY || "",
+  };
+}
+
 function getYahooHistoryCandidates(candidate) {
   const raw = normalizeHistorySourceSymbol(candidate.symbol);
-  const isCryptoPair = /^[a-z0-9]+(usd|eur)$/.test(raw);
+  const isCryptoPair = Boolean(parseExplicitCryptoPairSymbol(raw));
   if (candidate.currency === "EUR" && raw && !raw.includes(".") && !isCryptoPair) return [];
 
   const symbol = toYahooHistorySymbol(candidate.symbol);
   return symbol ? [{ symbol, currency: candidate.currency }] : [];
+}
+
+async function expandYahooCandidates(candidates, limit) {
+  const direct = uniqueBy(candidates.flatMap(getYahooHistoryCandidates), (candidate) => candidate.symbol);
+  const searchQueries = uniqueBy(
+    candidates
+      .map((candidate) => normalizeHistorySourceSymbol(candidate.symbol).replace(/\.(us|de|nl|pa|mi|ls|sw|l)$/i, ""))
+      .filter((symbol) => symbol && !/^[a-z0-9]+(usd|eur)$/i.test(symbol)),
+    (symbol) => symbol,
+  ).slice(0, 4);
+  const searched = [];
+
+  for (const query of searchQueries) {
+    const matches = await fetchYahooSearchCandidates(query).catch(() => []);
+    searched.push(...matches);
+  }
+
+  const searchedBySymbol = new Map(searched.map((candidate) => [candidate.symbol, candidate]));
+  const enrichedDirect = direct.map((candidate) => ({
+    ...candidate,
+    name: candidate.name || searchedBySymbol.get(candidate.symbol)?.name || "",
+  }));
+
+  return uniqueBy([...enrichedDirect, ...searched], (candidate) => candidate.symbol).slice(0, limit);
+}
+
+async function fetchYahooSearchCandidates(query) {
+  const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(query)}&quotesCount=6&newsCount=0`;
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+      "User-Agent": "Mozilla/5.0 GinjerelFinance/0.1",
+    },
+  });
+
+  if (!response.ok) throw new Error(`Yahoo search HTTP ${response.status}`);
+  const data = await response.json();
+  const quotes = Array.isArray(data?.quotes) ? data.quotes : [];
+  const normalizedQuery = normalizeHistorySourceSymbol(query);
+  return quotes
+    .filter((quote) => quote?.symbol && ["EQUITY", "ETF", "MUTUALFUND", "CRYPTOCURRENCY"].includes(String(quote.quoteType || "").toUpperCase()))
+    .sort((a, b) => {
+      const aSymbol = normalizeHistorySourceSymbol(a.symbol);
+      const bSymbol = normalizeHistorySourceSymbol(b.symbol);
+      const aExact = aSymbol === normalizedQuery ? 0 : 1;
+      const bExact = bSymbol === normalizedQuery ? 0 : 1;
+      return aExact - bExact;
+    })
+    .map((quote) => ({
+      symbol: String(quote.symbol || "").toUpperCase(),
+      currency: inferCurrencyFromHistorySymbol(quote.symbol),
+      name: firstString(quote.longname, quote.shortname, quote.name),
+    }));
+}
+
+function expandStooqCandidates(candidates, limit) {
+  return uniqueBy((Array.isArray(candidates) ? candidates : []).flatMap(getStooqCandidates), (candidate) => candidate.symbol)
+    .slice(0, limit);
+}
+
+function getStooqCandidates(candidate) {
+  const raw = normalizeHistorySourceSymbol(candidate?.symbol);
+  if (!raw || parseExplicitCryptoPairSymbol(raw)) return [];
+
+  const currency = normalizeCurrency(candidate?.currency || inferCurrencyFromHistorySymbol(raw));
+  if (raw.includes(".")) return [{ symbol: raw.toLowerCase(), currency }];
+  if (raw.includes("=") || raw.includes("-")) return [];
+
+  if (currency === "USD") {
+    return [
+      { symbol: `${raw}.us`, currency: "USD" },
+      { symbol: raw, currency },
+    ];
+  }
+
+  return [
+    { symbol: raw, currency },
+    { symbol: `${raw}.de`, currency: "EUR" },
+    { symbol: `${raw}.nl`, currency: "EUR" },
+    { symbol: `${raw}.pa`, currency: "EUR" },
+    { symbol: `${raw}.mi`, currency: "EUR" },
+    { symbol: `${raw}.ls`, currency: "EUR" },
+    { symbol: `${raw}.us`, currency: "USD" },
+  ];
+}
+
+async function fetchStooqHistory(sourceSymbol, days) {
+  return {
+    points: await fetchStooqDailyPrices(sourceSymbol, days),
+  };
+}
+
+async function fetchStooqQuote(sourceSymbol) {
+  const points = await fetchStooqDailyPrices(sourceSymbol, 14);
+  if (points.length < 1) throw new Error("No Stooq quote prices");
+
+  const latest = points.at(-1);
+  const previous = points.length > 1 ? points.at(-2) : null;
+  return {
+    price: latest.value,
+    dayChangePct: previous?.value > 0 ? percentChange(latest.value, previous.value) : 0,
+    marketTime: latest.date,
+  };
+}
+
+async function fetchStooqDailyPrices(sourceSymbol, days) {
+  const today = new Date();
+  const start = new Date(today);
+  start.setDate(today.getDate() - clampNumber(Number(days) || 30, 7, STOCK_HISTORY_MAX_DAYS));
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(String(sourceSymbol || "").toLowerCase())}&d1=${formatStooqDate(start)}&d2=${formatStooqDate(today)}&i=d`;
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8",
+      "User-Agent": "Mozilla/5.0 GinjerelFinance/0.1",
+    },
+  });
+  if (!response.ok) throw new Error(`Stooq HTTP ${response.status}`);
+
+  const points = parseStooqPriceCsv(await response.text());
+  if (points.length < 1) throw new Error("No Stooq prices");
+  return points;
+}
+
+function parseStooqPriceCsv(csv) {
+  const lines = String(csv || "").trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2 || /^no data/i.test(lines[0])) return [];
+
+  const headers = lines[0].split(",").map((header) => header.trim().toLowerCase());
+  const dateIndex = headers.indexOf("date");
+  const closeIndex = headers.indexOf("close");
+  if (dateIndex < 0 || closeIndex < 0) return [];
+
+  return lines.slice(1)
+    .map((line) => {
+      const cells = line.split(",");
+      const date = String(cells[dateIndex] || "").trim();
+      return {
+        date: /^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date}T00:00:00.000Z` : "",
+        value: Number(cells[closeIndex]),
+      };
+    })
+    .filter((point) => point.date && Number.isFinite(point.value) && point.value > 0);
+}
+
+function formatStooqDate(date) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}${month}${day}`;
+}
+
+function isYahooCryptoPairSymbol(symbol) {
+  return /^[A-Z0-9]{2,20}-(USD|EUR|USDT|USDC)$/i.test(String(symbol || ""));
 }
 
 function toYahooHistorySymbol(sourceSymbol) {
@@ -524,6 +1156,7 @@ async function fetchYahooQuote(sourceSymbol) {
     price,
     currency: normalizeCurrency(meta.currency),
     dayChangePct: Number.isFinite(previous) && previous > 0 ? percentChange(price, previous) : 0,
+    name: firstString(meta.longName, meta.shortName, meta.displayName),
     marketTime: Number.isFinite(Number(meta.regularMarketTime)) ? new Date(Number(meta.regularMarketTime) * 1000).toISOString() : "",
   };
 }
@@ -1050,6 +1683,10 @@ function clampNumber(value, min, max) {
 
 function firstPositiveNumber(...values) {
   return values.map(Number).find((value) => Number.isFinite(value) && value > 0);
+}
+
+function firstString(...values) {
+  return values.map((value) => String(value || "").trim()).find(Boolean) || "";
 }
 
 function percentChange(value, previous) {

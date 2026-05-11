@@ -62,11 +62,6 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-1 6h2v9h2V9h2v9h2V9h2l-.7 11H6.7L6 9h2Z"/></svg>
               </button>
             </div>
-            <div class="market-status" id="marketStatus">EUR view</div>
-            <label class="search-box">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 4a5.5 5.5 0 0 1 4.38 8.83l4.65 4.64-1.06 1.06-4.64-4.65A5.5 5.5 0 1 1 9.5 4Zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/></svg>
-              <input id="holdingSearch" type="search" placeholder="Search ticker or name" autocomplete="off">
-            </label>
             <button class="icon-button" id="refreshMarketData" type="button" aria-label="Refresh FX and prices" title="Refresh FX and prices">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5a7 7 0 0 1 6.32 4H16l3.5 3.5L23 9h-2.58A9 9 0 0 0 4.06 5.64l1.42 1.42A6.97 6.97 0 0 1 12 5Zm-7.5 6.5L1 15h2.58a9 9 0 0 0 16.36 3.36l-1.42-1.42A7 7 0 0 1 5.68 15H8l-3.5-3.5Z"/></svg>
             </button>
@@ -114,6 +109,10 @@
                 <span>Realized G/L</span>
                 <strong id="realizedGain">EUR 0.00</strong>
               </div>
+              <div class="portfolio-summary-row total-gain-row">
+                <span>Total G/L</span>
+                <strong id="totalGain">EUR 0.00</strong>
+              </div>
             </div>
             <span id="valueChange" hidden></span>
             <span id="dayChangePct" hidden></span>
@@ -131,6 +130,7 @@
               </div>
               <span class="performance-range-pill" id="performanceRangeLabel">Since first transaction</span>
             </div>
+            <div class="segmented-control compact performance-range-controls" id="performanceRangeControls" role="tablist" aria-label="Performance time range"></div>
             <div class="benchmark-controls compact-benchmark-controls" id="benchmarkControls" aria-label="Benchmark toggles"></div>
             <div class="chart-frame compact-chart-frame">
               <canvas id="performanceChart" aria-label="Portfolio performance line chart"></canvas>
@@ -182,12 +182,22 @@
           </aside>
         </section>
 
-        <section class="watchlist-grid" id="watchlist" aria-label="AI research watchlists" hidden>
+        <section class="watchlist-grid" id="watchlist" aria-label="Research watchlist">
           <article class="panel watchlist-panel">
             <div class="panel-header">
               <div>
-                <p class="label">AI watchlists</p>
-                <h3>Research ideas</h3>
+                <p class="label">Watchlist</p>
+                <h3>Research table</h3>
+              </div>
+              <form class="watchlist-add-form" id="watchlistAddForm">
+                <label class="sr-only" for="watchlistTickerInput">Ticker</label>
+                <input id="watchlistTickerInput" name="watchlistTicker" type="text" placeholder="AAPL, SUI-USD..." autocomplete="off">
+                <button class="primary-button compact-button" type="submit">Add</button>
+                <button class="secondary-button compact-button" type="button" data-refresh-watchlist>Refresh</button>
+              </form>
+              <div class="watchlist-status" id="watchlistStatus" role="status">
+                <span class="status-spinner" id="watchlistSpinner" aria-hidden="true" hidden></span>
+                <span id="watchlistStatusText"></span>
               </div>
             </div>
             <div class="watchlist-list" id="watchlistBody"></div>
