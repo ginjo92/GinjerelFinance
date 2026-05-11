@@ -1412,7 +1412,15 @@ function serveStatic(req, res) {
       return;
     }
 
-    res.writeHead(200, { "Content-Type": mimeTypes[path.extname(resolved).toLowerCase()] || "application/octet-stream" });
+    const extension = path.extname(resolved).toLowerCase();
+    const headers = {
+      "Content-Type": mimeTypes[extension] || "application/octet-stream",
+    };
+    if ([".html", ".js", ".css"].includes(extension)) {
+      headers["Cache-Control"] = "no-store, max-age=0";
+    }
+
+    res.writeHead(200, headers);
     if (req.method === "HEAD") res.end();
     else res.end(data);
   });
